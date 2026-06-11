@@ -28,6 +28,12 @@
     gap: 6px;
 }
 
+.preset-reader-selected-count {
+    margin-left: auto;
+    opacity: 0.75;
+    white-space: nowrap;
+}
+
 .preset-reader-filters label {
     display: flex;
     flex-direction: column;
@@ -89,9 +95,31 @@
     opacity: 0.8;
 }
 
+.preset-reader-item-row {
+    display: flex;
+    gap: 6px;
+    align-items: stretch;
+    min-width: 0;
+}
+
+.preset-reader-preselect-wrap {
+    display: flex;
+    flex: 0 0 28px;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+}
+
+.preset-reader-preselect {
+    width: 16px;
+    height: 16px;
+}
+
 .preset-reader-item {
     display: flex;
-    width: 100%;
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
     flex-direction: column;
     gap: 2px;
     align-items: flex-start;
@@ -165,6 +193,58 @@
     background: transparent;
 }
 
+.preset-reader-agent-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: min(560px, 82vw);
+}
+
+.preset-reader-agent-settings label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.preset-reader-agent-settings input {
+    width: 100%;
+}
+
+.preset-reader-agent-settings-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.preset-reader-agent-settings-actions,
+.preset-reader-agent-result-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.preset-reader-agent-result {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    height: min(74vh, 760px);
+    min-width: min(760px, 86vw);
+    overflow: hidden;
+}
+
+.preset-reader-agent-result-toolbar span {
+    opacity: 0.75;
+}
+
+#preset-reader-agent-result-text {
+    flex: 1 1 auto;
+    min-height: 0;
+    resize: none;
+    overflow: auto;
+    white-space: pre-wrap;
+}
+
 @media (max-width: 800px) {
     .preset-reader-panel {
         height: min(82vh, 760px);
@@ -178,5 +258,14 @@
 
     .preset-reader-list {
         max-height: none;
+    }
+
+    .preset-reader-selected-count {
+        width: 100%;
+        margin-left: 0;
+    }
+
+    .preset-reader-agent-settings-grid {
+        grid-template-columns: 1fr;
     }
 }

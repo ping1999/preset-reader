@@ -44,6 +44,22 @@ Other extensions or helper scripts can call:
 const snapshot = await window.PresetReaderAPI.readAll();
 ```
 
+## Format Skill Agent
+
+In the panel, tick the presets that should be used as formatting sources, then open `Agent API` and configure an OpenAI-compatible chat-completions endpoint.
+
+After that, click `生成格式 Skill`. The agent reads the selected presets' `content` text, extracts formatting rules such as paired tags, section order, wrapper names, and output-only constraints, then returns a reusable repair prompt/skill. That skill is intended for rewriting already generated text back into the required format without changing its facts.
+
+Public API:
+
+```js
+const result = await window.PresetReaderAPI.generateFormatSkill(items, {
+  endpoint: 'https://api.openai.com/v1/chat/completions',
+  model: 'gpt-4.1-mini',
+  apiKey: '...',
+});
+```
+
 ## Notes
 
 shujuku exposes plot presets and API presets through `window.AutoCardUpdaterAPI`.

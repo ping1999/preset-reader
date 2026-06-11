@@ -1,4 +1,4 @@
-import { getRequestHeaders } from '../../../../script.js';
+import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
@@ -13,8 +13,25 @@ const SHUJUKU_ID = 'shujuku_v120';
 const SHUJUKU_TEMPLATE_PRESETS_KEY = `${SHUJUKU_ID}_templatePresets_v1`;
 const SHUJUKU_CONFIG_DB = `${SHUJUKU_ID}_config_v1`;
 const SHUJUKU_CONFIG_STORE = 'kv';
+const AGENT_PRESET_ITEM_LIMIT = 8000;
+const AGENT_PRESET_TOTAL_LIMIT = 28000;
+const AGENT_SYSTEM_PROMPT = `你是“预设格式修复 Skill 生成 Agent”。
+你的任务是阅读用户选中的 SillyTavern 预设 content，提取其中所有对输出格式、XML/HTML 标签、包裹符、章节顺序、字段名、禁止重复、语言风格、思考/正文分离的要求。
+你要输出一份可直接交给另一个 AI 使用的“格式修复 skill/提示词”。这份 skill 用来处理已经生成但没有遵守格式的文本：在不改写事实、不扩写剧情、不新增设定的前提下，重新补齐格式、标签、顺序和分段。
+输出必须是中文，必须只交付最终 skill/提示词正文，不要解释你如何分析，不要输出对用户预设内容的总结。
+如果预设要求使用成对标签，例如 <dm_set>...</dm_set>，必须在 skill 中明确要求保留并补齐这类标签。`;
+
+const DEFAULT_AGENT_SETTINGS = Object.freeze({
+    endpoint: 'https://api.openai.com/v1/chat/completions',
+    model: '',
+    apiKey: '',
+    temperature: 0.2,
+    maxTokens: 1800,
+    selectedPresetKeys: [],
+});
 
 let lastSnapshot = null;
+let lastFormatSkill = null;
 let menuInitialized = false;
 let commandsInitialized = false;
 
@@ -63,6 +80,50 @@ function sanitizeFileName(value) {
 function normalizeFilterValue(value) {
     const text = String(value ?? '').trim();
     return text || 'all';
+}
+
+function getSettingsRoot() {
+    extension_settings[EXTENSION_ID] = extension_settings[EXTENSION_ID] || {};
+    extension_settings[EXTENSION_ID].agent = {
+        ...DEFAULT_AGENT_SETTINGS,
+        ...(extension_settings[EXTENSION_ID].agent || {}),
+    };
+
+    if (!Array.isArray(extension_settings[EXTENSION_ID].agent.selectedPresetKeys)) {
+        extension_settings[EXTENSION_ID].agent.selectedPresetKeys = [];
+    }
+
+    return extension_settings[EXTENSION_ID];
+}
+
+function getAgentSettings() {
+    const settings = getSettingsRoot().agent;
+    return {
+        ...DEFAULT_AGENT_SETTINGS,
+        ...settings,
+        selectedPresetKeys: [...(settings.selectedPresetKeys || [])],
+    };
+}
+
+function saveAgentSettings(nextSettings) {
+    const root = getSettingsRoot();
+    root.agent = {
+        ...root.agent,
+        ...nextSettings,
+        selectedPresetKeys: Array.isArray(nextSettings.selectedPresetKeys)
+            ? [...nextSettings.selectedPresetKeys]
+            : root.agent.selectedPresetKeys,
+    };
+    saveSettingsDebounced();
+}
+
+function makeSelectionKey(item, fallbackIndex = '') {
+    return [
+        item.source,
+        item.kind,
+        item.meta?.index ?? fallbackIndex,
+        item.name,
+    ].map(part => encodeURIComponent(String(part ?? ''))).join('|');
 }
 
 function getNameFromContent(content, fallback) {
@@ -627,6 +688,252 @@ function resultToMarkdown(snapshot) {
     return lines.join('\n');
 }
 
+function collectTextFromContent(value, parts, seen = new WeakSet(), label = 'content') {
+    if (value == null) {
+        return;
+    }
+
+    if (typeof value === 'string') {
+        const text = value.trim();
+        if (text) {
+            parts.push(`【${label}】\n${text}`);
+        }
+        return;
+    }
+
+    if (typeof value === 'number' || typeof value === 'boolean') {
+        return;
+    }
+
+    if (Array.isArray(value)) {
+        value.forEach((entry, index) => collectTextFromContent(entry, parts, seen, `${label}[${index}]`));
+        return;
+    }
+
+    if (typeof value !== 'object' || seen.has(value)) {
+        return;
+    }
+
+    seen.add(value);
+    const preferredKeys = [
+        'content',
+        'prompt',
+        'system_prompt',
+        'systemPrompt',
+        'main_prompt',
+        'instruction',
+        'instructions',
+        'rules',
+        'format',
+        'template',
+        'templateStr',
+        'text',
+        'value',
+        'message',
+        'prefix',
+        'suffix',
+    ];
+
+    for (const key of preferredKeys) {
+        if (Object.prototype.hasOwnProperty.call(value, key)) {
+            collectTextFromContent(value[key], parts, seen, key);
+        }
+    }
+
+    for (const [key, entry] of Object.entries(value)) {
+        if (preferredKeys.includes(key)) {
+            continue;
+        }
+        if (/content|prompt|rule|format|template|instruction|message|tag|wrap|prefix|suffix/i.test(key)) {
+            collectTextFromContent(entry, parts, seen, key);
+        }
+    }
+}
+
+function extractPresetContentText(content) {
+    const parts = [];
+    collectTextFromContent(content, parts);
+
+    if (!parts.length) {
+        return safeStringify(content);
+    }
+
+    return parts.join('\n\n');
+}
+
+function limitText(text, limit) {
+    const value = String(text || '');
+    if (value.length <= limit) {
+        return value;
+    }
+
+    return `${value.slice(0, limit)}\n\n[内容过长，已截断 ${value.length - limit} 字符]`;
+}
+
+function buildAgentUserPrompt(selectedItems) {
+    let totalLength = 0;
+    const sections = [];
+
+    for (const [index, item] of selectedItems.entries()) {
+        if (totalLength >= AGENT_PRESET_TOTAL_LIMIT) {
+            sections.push('[后续预设因上下文长度限制已省略]');
+            break;
+        }
+
+        const rawText = extractPresetContentText(item.content);
+        const itemText = limitText(rawText, AGENT_PRESET_ITEM_LIMIT);
+        const remaining = AGENT_PRESET_TOTAL_LIMIT - totalLength;
+        const finalText = limitText(itemText, remaining);
+        totalLength += finalText.length;
+        sections.push([
+            `## 预设 ${index + 1}: ${item.name}`,
+            `来源: ${item.sourceLabel} / ${item.kindLabel}`,
+            '```text',
+            finalText,
+            '```',
+        ].join('\n'));
+    }
+
+    return [
+        '请基于下面这些用户预选预设的 content，生成一份“格式修复 skill/提示词”。',
+        '',
+        '这份 skill 的使用场景：另一个 AI 已经生成了一段内容，但没有遵守这些预设要求的格式；使用者会把那段未格式化内容交给这个 skill，让 AI 在不改变事实、不扩写、不新增设定的情况下重新补齐格式。',
+        '',
+        'skill 必须包含：',
+        '- 对输入文本的占位说明，例如“待修复文本”。',
+        '- 从预设中抽取到的标签、包裹符、章节顺序、字段名、换行规则和禁止项。',
+        '- 明确要求保留原文事实、角色、事件、时间线，不新增剧情。',
+        '- 明确要求只输出修复后的文本，不解释修复过程。',
+        '- 如果存在 <xxx>...</xxx> 这类标签，必须要求成对补齐并把对应内容放入标签内。',
+        '',
+        '用户预选预设 content：',
+        '',
+        sections.join('\n\n'),
+    ].join('\n');
+}
+
+function normalizeAgentEndpoint(endpoint) {
+    const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
+    if (!trimmed) {
+        return '';
+    }
+
+    if (/\/chat\/completions$/i.test(trimmed)) {
+        return trimmed;
+    }
+
+    if (/\/v1$/i.test(trimmed)) {
+        return `${trimmed}/chat/completions`;
+    }
+
+    return `${trimmed}/v1/chat/completions`;
+}
+
+function extractAgentResponseText(payload) {
+    if (typeof payload?.output_text === 'string') {
+        return payload.output_text;
+    }
+
+    const firstChoice = payload?.choices?.[0];
+    if (typeof firstChoice?.message?.content === 'string') {
+        return firstChoice.message.content;
+    }
+
+    if (Array.isArray(firstChoice?.message?.content)) {
+        return firstChoice.message.content
+            .map(part => part?.text || part?.content || '')
+            .filter(Boolean)
+            .join('\n');
+    }
+
+    if (typeof firstChoice?.text === 'string') {
+        return firstChoice.text;
+    }
+
+    if (Array.isArray(payload?.output)) {
+        return payload.output
+            .flatMap(item => Array.isArray(item?.content) ? item.content : [])
+            .map(part => part?.text || '')
+            .filter(Boolean)
+            .join('\n');
+    }
+
+    return '';
+}
+
+async function generateFormatSkill(selectedItems, settings = getAgentSettings()) {
+    const endpoint = normalizeAgentEndpoint(settings.endpoint);
+    const model = String(settings.model || '').trim();
+
+    if (!selectedItems.length) {
+        throw new Error('请先勾选要交给 Agent 分析的预设。');
+    }
+
+    if (!endpoint) {
+        throw new Error('请先配置 Agent API 地址。');
+    }
+
+    if (!model) {
+        throw new Error('请先配置 Agent 模型名。');
+    }
+
+    const headers = {
+        'Content-Type': 'application/json',
+    };
+
+    if (settings.apiKey) {
+        headers.Authorization = `Bearer ${settings.apiKey}`;
+    }
+
+    const response = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+            model,
+            messages: [
+                { role: 'system', content: AGENT_SYSTEM_PROMPT },
+                { role: 'user', content: buildAgentUserPrompt(selectedItems) },
+            ],
+            temperature: Number(settings.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
+            max_tokens: Number(settings.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
+        }),
+    });
+
+    const responseText = await response.text();
+    let payload = null;
+
+    try {
+        payload = responseText ? JSON.parse(responseText) : null;
+    } catch {
+        payload = null;
+    }
+
+    if (!response.ok) {
+        throw new Error(payload?.error?.message || responseText || `Agent API 请求失败：HTTP ${response.status}`);
+    }
+
+    const skillText = extractAgentResponseText(payload).trim();
+    if (!skillText) {
+        throw new Error('Agent API 没有返回可用文本。');
+    }
+
+    lastFormatSkill = {
+        generatedAt: new Date().toISOString(),
+        model,
+        endpoint,
+        selectedPresets: selectedItems.map(item => ({
+            source: item.source,
+            sourceLabel: item.sourceLabel,
+            kind: item.kind,
+            kindLabel: item.kindLabel,
+            name: item.name,
+        })),
+        skill: skillText,
+    };
+
+    return lastFormatSkill;
+}
+
 function makePopupHtml() {
     return $(`
         <div id="${EXTENSION_ID}-panel" class="preset-reader-panel">
@@ -643,6 +950,23 @@ function makePopupHtml() {
                     <i class="fa-solid fa-download"></i>
                     <span>导出 JSON</span>
                 </button>
+                <button id="${EXTENSION_ID}-select-visible" class="menu_button">
+                    <i class="fa-solid fa-check-double"></i>
+                    <span>预选可见</span>
+                </button>
+                <button id="${EXTENSION_ID}-clear-selected" class="menu_button">
+                    <i class="fa-solid fa-square-xmark"></i>
+                    <span>清空预选</span>
+                </button>
+                <button id="${EXTENSION_ID}-agent-settings" class="menu_button">
+                    <i class="fa-solid fa-key"></i>
+                    <span>Agent API</span>
+                </button>
+                <button id="${EXTENSION_ID}-generate-skill" class="menu_button">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i>
+                    <span>生成格式 Skill</span>
+                </button>
+                <span id="${EXTENSION_ID}-selected-count" class="preset-reader-selected-count">已预选 0</span>
             </div>
             <div class="preset-reader-filters">
                 <label>
@@ -711,14 +1035,58 @@ function groupItems(items) {
     return groups;
 }
 
+function getPreselectedKeys(root) {
+    let keys = root.data('preselected-keys');
+    if (!(keys instanceof Set)) {
+        keys = new Set(getAgentSettings().selectedPresetKeys);
+        root.data('preselected-keys', keys);
+    }
+    return keys;
+}
+
+function savePreselectedKeys(root) {
+    const keys = getPreselectedKeys(root);
+    saveAgentSettings({ selectedPresetKeys: [...keys] });
+}
+
+function getPreselectedItems(root) {
+    const keys = getPreselectedKeys(root);
+    const allItems = root.data('all-items') || [];
+    return allItems.filter(item => keys.has(item.selectionKey));
+}
+
+function updateSelectedCount(root) {
+    const count = getPreselectedItems(root).length;
+    root.find(`#${EXTENSION_ID}-selected-count`).text(`已预选 ${count}`);
+    root.find(`#${EXTENSION_ID}-generate-skill`).prop('disabled', count === 0);
+}
+
+function selectVisibleItems(root) {
+    const allItems = root.data('all-items') || [];
+    const visible = filterItems(allItems, getUiFilters(root));
+    const keys = getPreselectedKeys(root);
+    visible.forEach(item => keys.add(item.selectionKey));
+    savePreselectedKeys(root);
+    renderList(root, allItems);
+}
+
+function clearPreselectedItems(root) {
+    getPreselectedKeys(root).clear();
+    savePreselectedKeys(root);
+    renderList(root, root.data('all-items') || []);
+}
+
 function renderList(root, allItems) {
     const list = root.find(`#${EXTENSION_ID}-list`);
     const filtered = filterItems(allItems, getUiFilters(root));
+    const preselectedKeys = getPreselectedKeys(root);
+    const selectedItem = root.data('selected-item');
     list.empty();
 
     if (!filtered.length) {
         list.append($('<div class="preset-reader-empty"></div>').text('没有匹配的预设'));
         renderPreview(root, null);
+        updateSelectedCount(root);
         return;
     }
 
@@ -726,27 +1094,47 @@ function renderList(root, allItems) {
         list.append($('<div class="preset-reader-group"></div>').text(group));
         items.forEach(item => {
             const row = $(`
-                <button class="preset-reader-item" type="button">
-                    <span class="preset-reader-item-name"></span>
-                    <small></small>
-                </button>
+                <div class="preset-reader-item-row">
+                    <label class="preset-reader-preselect-wrap">
+                        <input class="preset-reader-preselect" type="checkbox" aria-label="预选给 Agent">
+                    </label>
+                    <button class="preset-reader-item" type="button">
+                        <span class="preset-reader-item-name"></span>
+                        <small></small>
+                    </button>
+                </div>
             `);
+            const itemButton = row.find('.preset-reader-item');
+            const checkbox = row.find('.preset-reader-preselect');
             row.attr('data-id', item.id);
-            row.toggleClass('is-warning', item.status === 'warning');
+            row.attr('data-selection-key', item.selectionKey);
+            itemButton.toggleClass('is-warning', item.status === 'warning');
+            itemButton.toggleClass('is-selected', selectedItem?.selectionKey === item.selectionKey);
+            checkbox.prop('checked', preselectedKeys.has(item.selectionKey));
             row.find('.preset-reader-item-name').text(item.name);
             row.find('small').text(`${getContentMetric(item.content)}${item.warning ? ' / 有提示' : ''}`);
-            row.on('click', () => {
+            checkbox.on('change', () => {
+                if (checkbox.prop('checked')) {
+                    preselectedKeys.add(item.selectionKey);
+                } else {
+                    preselectedKeys.delete(item.selectionKey);
+                }
+                savePreselectedKeys(root);
+                updateSelectedCount(root);
+            });
+            itemButton.on('click', () => {
                 list.find('.preset-reader-item').removeClass('is-selected');
-                row.addClass('is-selected');
+                itemButton.addClass('is-selected');
                 renderPreview(root, item);
             });
             list.append(row);
         });
     }
 
-    const first = filtered[0];
-    list.find(`[data-id="${CSS.escape(first.id)}"]`).addClass('is-selected');
-    renderPreview(root, first);
+    const previewItem = filtered.find(item => item.selectionKey === selectedItem?.selectionKey) || filtered[0];
+    list.find(`[data-selection-key="${CSS.escape(previewItem.selectionKey)}"] .preset-reader-item`).addClass('is-selected');
+    renderPreview(root, previewItem);
+    updateSelectedCount(root);
 }
 
 function renderPreview(root, item) {
@@ -780,9 +1168,13 @@ async function loadIntoPanel(root) {
     const snapshot = await readAll();
     const allItems = snapshot.items.map((item, index) => ({
         id: `${item.source}:${item.kind}:${index}:${item.name}`,
+        selectionKey: makeSelectionKey(item, index),
         ...item,
     }));
 
+    if (!(root.data('preselected-keys') instanceof Set)) {
+        root.data('preselected-keys', new Set(getAgentSettings().selectedPresetKeys));
+    }
     root.data('all-items', allItems);
     refreshFilterOptions(root, allItems);
     renderStatus(root, snapshot);
@@ -824,11 +1216,152 @@ function exportCurrent(root) {
     download(safeStringify(payload), `${sanitizeFileName('preset-reader-export')}.json`, 'application/json');
 }
 
+function makeAgentSettingsHtml() {
+    const settings = getAgentSettings();
+    return $(`
+        <div class="preset-reader-agent-settings">
+            <label>
+                <span>API 地址</span>
+                <input id="${EXTENSION_ID}-agent-endpoint" type="text" placeholder="https://api.openai.com/v1/chat/completions">
+            </label>
+            <label>
+                <span>模型</span>
+                <input id="${EXTENSION_ID}-agent-model" type="text" placeholder="gpt-4.1-mini">
+            </label>
+            <label>
+                <span>API Key</span>
+                <input id="${EXTENSION_ID}-agent-api-key" type="password" autocomplete="off">
+            </label>
+            <div class="preset-reader-agent-settings-grid">
+                <label>
+                    <span>Temperature</span>
+                    <input id="${EXTENSION_ID}-agent-temperature" type="number" min="0" max="2" step="0.1">
+                </label>
+                <label>
+                    <span>Max Tokens</span>
+                    <input id="${EXTENSION_ID}-agent-max-tokens" type="number" min="256" max="32000" step="128">
+                </label>
+            </div>
+            <div class="preset-reader-agent-settings-actions">
+                <button id="${EXTENSION_ID}-agent-save" class="menu_button">
+                    <i class="fa-solid fa-floppy-disk"></i>
+                    <span>保存配置</span>
+                </button>
+            </div>
+        </div>
+    `).each((_, root) => {
+        const panel = $(root);
+        panel.find(`#${EXTENSION_ID}-agent-endpoint`).val(settings.endpoint);
+        panel.find(`#${EXTENSION_ID}-agent-model`).val(settings.model);
+        panel.find(`#${EXTENSION_ID}-agent-api-key`).val(settings.apiKey);
+        panel.find(`#${EXTENSION_ID}-agent-temperature`).val(settings.temperature);
+        panel.find(`#${EXTENSION_ID}-agent-max-tokens`).val(settings.maxTokens);
+    });
+}
+
+function readAgentSettingsForm(root) {
+    const temperature = Number(root.find(`#${EXTENSION_ID}-agent-temperature`).val());
+    const maxTokens = Number(root.find(`#${EXTENSION_ID}-agent-max-tokens`).val());
+
+    return {
+        endpoint: String(root.find(`#${EXTENSION_ID}-agent-endpoint`).val() || '').trim(),
+        model: String(root.find(`#${EXTENSION_ID}-agent-model`).val() || '').trim(),
+        apiKey: String(root.find(`#${EXTENSION_ID}-agent-api-key`).val() || '').trim(),
+        temperature: Number.isFinite(temperature) ? temperature : DEFAULT_AGENT_SETTINGS.temperature,
+        maxTokens: Number.isFinite(maxTokens) ? maxTokens : DEFAULT_AGENT_SETTINGS.maxTokens,
+    };
+}
+
+function showAgentSettings() {
+    const root = makeAgentSettingsHtml();
+    root.find(`#${EXTENSION_ID}-agent-save`).on('click', () => {
+        saveAgentSettings(readAgentSettingsForm(root));
+        toastr.success('Agent API 配置已保存');
+    });
+
+    callGenericPopup(root, POPUP_TYPE.TEXT, 'Preset Reader Agent API', {
+        wide: true,
+        allowVerticalScrolling: true,
+    });
+}
+
+function showAgentResult(result) {
+    const root = $(`
+        <div class="preset-reader-agent-result">
+            <div class="preset-reader-agent-result-toolbar">
+                <button id="${EXTENSION_ID}-agent-copy-result" class="menu_button">
+                    <i class="fa-solid fa-copy"></i>
+                    <span>复制 Skill</span>
+                </button>
+                <button id="${EXTENSION_ID}-agent-download-result" class="menu_button">
+                    <i class="fa-solid fa-download"></i>
+                    <span>下载 Markdown</span>
+                </button>
+                <span>${escapeHtml(result.model)} / ${result.selectedPresets.length} 个预设</span>
+            </div>
+            <textarea id="${EXTENSION_ID}-agent-result-text" readonly></textarea>
+        </div>
+    `);
+    root.find(`#${EXTENSION_ID}-agent-result-text`).val(result.skill);
+    root.find(`#${EXTENSION_ID}-agent-copy-result`).on('click', async () => {
+        try {
+            await navigator.clipboard.writeText(result.skill);
+            toastr.success('Skill 已复制到剪贴板');
+        } catch {
+            toastr.error('复制失败');
+        }
+    });
+    root.find(`#${EXTENSION_ID}-agent-download-result`).on('click', () => {
+        download(result.skill, `${sanitizeFileName('preset-format-skill')}.md`, 'text/markdown');
+    });
+
+    callGenericPopup(root, POPUP_TYPE.TEXT, '格式修复 Skill', {
+        wide: true,
+        large: true,
+        allowVerticalScrolling: false,
+    });
+}
+
+async function generateFormatSkillFromPanel(root) {
+    const button = root.find(`#${EXTENSION_ID}-generate-skill`);
+    const selectedItems = getPreselectedItems(root);
+
+    if (!selectedItems.length) {
+        toastr.warning('请先勾选要交给 Agent 分析的预设');
+        return;
+    }
+
+    try {
+        button.prop('disabled', true);
+        button.find('span').text('生成中...');
+        root.find(`#${EXTENSION_ID}-status`).text(`Agent 正在分析 ${selectedItems.length} 个预设...`);
+
+        const result = await generateFormatSkill(selectedItems);
+        if (lastSnapshot) {
+            renderStatus(root, lastSnapshot);
+        }
+        showAgentResult(result);
+        toastr.success('格式修复 Skill 已生成');
+    } catch (error) {
+        if (lastSnapshot) {
+            renderStatus(root, lastSnapshot);
+        }
+        toastr.error(error?.message || String(error));
+    } finally {
+        button.find('span').text('生成格式 Skill');
+        updateSelectedCount(root);
+    }
+}
+
 async function showPresetReader() {
     const root = makePopupHtml();
     root.find(`#${EXTENSION_ID}-refresh`).on('click', () => loadIntoPanel(root).catch(error => toastr.error(error?.message || String(error))));
     root.find(`#${EXTENSION_ID}-copy`).on('click', () => copySelected(root));
     root.find(`#${EXTENSION_ID}-export`).on('click', () => exportCurrent(root));
+    root.find(`#${EXTENSION_ID}-select-visible`).on('click', () => selectVisibleItems(root));
+    root.find(`#${EXTENSION_ID}-clear-selected`).on('click', () => clearPreselectedItems(root));
+    root.find(`#${EXTENSION_ID}-agent-settings`).on('click', () => showAgentSettings());
+    root.find(`#${EXTENSION_ID}-generate-skill`).on('click', () => generateFormatSkillFromPanel(root));
     root.find(`#${EXTENSION_ID}-source, #${EXTENSION_ID}-kind, #${EXTENSION_ID}-search`).on('input change', () => {
         renderList(root, root.data('all-items') || []);
     });
@@ -929,6 +1462,11 @@ function exposeApi() {
     window[API_NAME] = {
         readAll,
         getLastSnapshot: () => clone(lastSnapshot),
+        getLastFormatSkill: () => clone(lastFormatSkill),
+        getAgentSettings,
+        saveAgentSettings,
+        generateFormatSkill,
+        openAgentSettings: showAgentSettings,
         open: showPresetReader,
     };
 }

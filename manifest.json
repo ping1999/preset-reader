@@ -6,8 +6,8 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Codex",
-    "version": "1.0.0",
-    "homePage": "https://github.com/SillyTavern/SillyTavern",
+    "version": "1.1.0",
+    "homePage": "https://github.com/ping1999/preset-reader",
     "hooks": {
         "activate": "init"
     }

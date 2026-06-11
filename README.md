@@ -47,6 +47,7 @@ const snapshot = await window.PresetReaderAPI.readAll();
 ## Format Skill Agent
 
 In the panel, tick the presets that should be used as formatting sources, then open `Agent API` and configure an OpenAI-compatible `/v1` base endpoint.
+The `预选清单` box shows the currently selected presets at a glance; click an item to preview it or remove it from the selection.
 The model box automatically fetches available models from `/models`, and generation automatically appends `/chat/completions`.
 The default request mode is `酒馆后端转发`, which sends model and generation requests through SillyTavern's backend. Use it for LAN HTTP APIs, HTTPS SillyTavern pages, or providers that do not allow browser CORS requests.
 When building the agent request, the extension recursively scans the selected preset object for prompt text fields such as `content`, `rules`, `format`, and `template`. For shujuku plot presets, a same-name `exportAllPlotPresets` record is used to enrich the displayed preset when it contains more complete content.

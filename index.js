@@ -1239,6 +1239,15 @@ function makePopupHtml() {
                 </label>
             </div>
             <div id="${EXTENSION_ID}-status" class="preset-reader-status">正在读取...</div>
+            <div class="preset-reader-selected-panel">
+                <div class="preset-reader-selected-panel-header">
+                    <strong>预选清单</strong>
+                    <small id="${EXTENSION_ID}-selected-summary">勾选后显示</small>
+                </div>
+                <div id="${EXTENSION_ID}-selected-list" class="preset-reader-selected-list">
+                    <span class="preset-reader-selected-empty">暂无预选</span>
+                </div>
+            </div>
             <div class="preset-reader-layout">
                 <div id="${EXTENSION_ID}-list" class="preset-reader-list"></div>
                 <div class="preset-reader-preview">
@@ -1311,10 +1320,55 @@ function getPreselectedItems(root) {
     return allItems.filter(item => keys.has(item.selectionKey));
 }
 
+function previewItemFromSelection(root, item) {
+    const list = root.find(`#${EXTENSION_ID}-list`);
+    list.find('.preset-reader-item').removeClass('is-selected');
+    list.find(`[data-selection-key="${CSS.escape(item.selectionKey)}"] .preset-reader-item`).addClass('is-selected');
+    renderPreview(root, item);
+}
+
+function renderPreselectedPanel(root) {
+    const selectedItems = getPreselectedItems(root);
+    const selectedList = root.find(`#${EXTENSION_ID}-selected-list`);
+    const summary = root.find(`#${EXTENSION_ID}-selected-summary`);
+
+    summary.text(selectedItems.length ? `${selectedItems.length} 个预设` : '勾选后显示');
+    selectedList.empty();
+
+    if (!selectedItems.length) {
+        selectedList.append($('<span class="preset-reader-selected-empty"></span>').text('暂无预选'));
+        return;
+    }
+
+    selectedItems.forEach(item => {
+        const row = $(`
+            <div class="preset-reader-selected-pill">
+                <button class="preset-reader-selected-preview" type="button">
+                    <strong></strong>
+                    <small></small>
+                </button>
+                <button class="preset-reader-selected-remove" type="button" aria-label="移除预选">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+        `);
+        row.find('strong').text(item.name);
+        row.find('small').text(`${item.sourceLabel} / ${item.kindLabel}`);
+        row.find('.preset-reader-selected-preview').on('click', () => previewItemFromSelection(root, item));
+        row.find('.preset-reader-selected-remove').on('click', () => {
+            getPreselectedKeys(root).delete(item.selectionKey);
+            savePreselectedKeys(root);
+            renderList(root, root.data('all-items') || []);
+        });
+        selectedList.append(row);
+    });
+}
+
 function updateSelectedCount(root) {
     const count = getPreselectedItems(root).length;
     root.find(`#${EXTENSION_ID}-selected-count`).text(`已预选 ${count}`);
     root.find(`#${EXTENSION_ID}-generate-skill`).prop('disabled', count === 0);
+    renderPreselectedPanel(root);
 }
 
 function selectVisibleItems(root) {

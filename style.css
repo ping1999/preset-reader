@@ -18,7 +18,8 @@
 
 .preset-reader-toolbar,
 .preset-reader-filters,
-.preset-reader-status {
+.preset-reader-status,
+.preset-reader-selected-panel {
     flex: 0 0 auto;
 }
 
@@ -63,6 +64,87 @@
 .preset-reader-issues {
     margin-top: 6px;
     color: var(--warning);
+}
+
+.preset-reader-selected-panel {
+    display: grid;
+    grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
+    gap: 8px;
+    align-items: start;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 8px;
+    background: var(--black30a);
+}
+
+.preset-reader-selected-panel-header {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+}
+
+.preset-reader-selected-panel-header small,
+.preset-reader-selected-empty {
+    opacity: 0.72;
+}
+
+.preset-reader-selected-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    max-height: 92px;
+    min-height: 28px;
+    overflow: auto;
+}
+
+.preset-reader-selected-pill {
+    display: inline-flex;
+    max-width: min(420px, 100%);
+    min-width: 0;
+    overflow: hidden;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background: var(--black50a);
+}
+
+.preset-reader-selected-preview,
+.preset-reader-selected-remove {
+    border: 0;
+    background: transparent;
+    color: var(--SmartThemeBodyColor);
+}
+
+.preset-reader-selected-preview {
+    display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 5px 8px;
+    text-align: left;
+}
+
+.preset-reader-selected-preview strong,
+.preset-reader-selected-preview small {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.preset-reader-selected-preview small {
+    opacity: 0.72;
+}
+
+.preset-reader-selected-preview:hover,
+.preset-reader-selected-remove:hover {
+    background: var(--black50a);
+}
+
+.preset-reader-selected-remove {
+    flex: 0 0 30px;
+    border-left: 1px solid var(--SmartThemeBorderColor);
 }
 
 .preset-reader-layout {
@@ -308,6 +390,10 @@
     .preset-reader-selected-count {
         width: 100%;
         margin-left: 0;
+    }
+
+    .preset-reader-selected-panel {
+        grid-template-columns: 1fr;
     }
 
     .preset-reader-agent-settings-grid {

@@ -279,7 +279,7 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
-    min-width: min(560px, 82vw);
+    min-width: min(680px, 86vw);
 }
 
 .preset-reader-agent-settings label {
@@ -309,19 +309,23 @@
     opacity: 0.75;
 }
 
+.preset-reader-api-preset-row,
 .preset-reader-model-field {
     display: flex;
     gap: 8px;
     align-items: center;
 }
 
+.preset-reader-api-preset-row select,
 .preset-reader-model-field input {
     flex: 1 1 auto;
     min-width: 0;
 }
 
+.preset-reader-api-preset-row .menu_button,
 .preset-reader-model-field .menu_button,
-.preset-reader-agent-settings-actions .menu_button {
+.preset-reader-agent-settings-actions .menu_button,
+.preset-reader-api-preset-editor-actions .menu_button {
     display: inline-flex;
     flex: 0 0 auto;
     align-items: center;
@@ -332,9 +336,69 @@
     white-space: nowrap;
 }
 
+.preset-reader-model-options {
+    max-height: 240px;
+    margin-top: 6px;
+    overflow-y: auto;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background: var(--black50a, #101826);
+}
+
+.preset-reader-model-option {
+    display: block;
+    width: 100%;
+    padding: 6px 8px;
+    overflow: hidden;
+    border: 0;
+    background: transparent;
+    color: var(--SmartThemeBodyColor, #f4f7fb);
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.preset-reader-model-option:hover,
+.preset-reader-model-option.is-current {
+    background: var(--black30a);
+}
+
+.preset-reader-model-empty {
+    padding: 8px;
+    opacity: 0.72;
+}
+
 .preset-reader-agent-model-status {
     min-height: 1.2em;
     opacity: 0.75;
+}
+
+.preset-reader-api-preset-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: min(520px, 82vw);
+}
+
+.preset-reader-api-preset-editor label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.preset-reader-api-preset-editor input {
+    width: 100%;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 4px;
+    background: var(--black50a, #101826);
+    color: var(--SmartThemeBodyColor, #f4f7fb);
+}
+
+.preset-reader-api-preset-editor-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
 }
 
 .preset-reader-agent-settings-grid {
@@ -400,6 +464,7 @@
         grid-template-columns: 1fr;
     }
 
+    .preset-reader-api-preset-row,
     .preset-reader-model-field {
         align-items: stretch;
         flex-direction: column;

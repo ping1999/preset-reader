@@ -48,8 +48,9 @@ const snapshot = await window.PresetReaderAPI.readAll();
 
 In the panel, tick the presets that should be used as formatting sources, then open `Agent API` and configure an OpenAI-compatible `/v1` base endpoint.
 The `预选清单` box shows the currently selected presets at a glance; click an item to preview it or remove it from the selection.
+The API preset selector stores multiple endpoint/model/key profiles, and the model selector uses a scrollable in-extension dropdown instead of the browser datalist.
 The model box automatically fetches available models from `/models`, and generation automatically appends `/chat/completions`.
-The default request mode is `酒馆后端转发`, which sends model and generation requests through SillyTavern's backend. Use it for LAN HTTP APIs, HTTPS SillyTavern pages, or providers that do not allow browser CORS requests.
+Agent requests are always sent through SillyTavern's backend, so LAN HTTP APIs, HTTPS SillyTavern pages, and providers that do not allow browser CORS requests can still work.
 When building the agent request, the extension recursively scans the selected preset object for prompt text fields such as `content`, `rules`, `format`, and `template`. For shujuku plot presets, a same-name `exportAllPlotPresets` record is used to enrich the displayed preset when it contains more complete content.
 
 After that, click `生成格式 Skill`. The agent reads the selected presets' `content` text, extracts formatting rules such as paired tags, section order, wrapper names, and output-only constraints, then returns a reusable repair prompt/skill. That skill is intended for rewriting already generated text back into the required format without changing its facts.

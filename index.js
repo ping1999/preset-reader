@@ -25,9 +25,10 @@ const DEFAULT_AGENT_SETTINGS = Object.freeze({
     endpoint: 'https://api.openai.com/v1',
     model: '',
     apiKey: '',
-    requestMode: 'sillytavern',
     temperature: 0.2,
     maxTokens: 1800,
+    activeApiPresetId: 'default',
+    apiPresets: [],
     selectedPresetKeys: [],
 });
 
@@ -89,6 +90,7 @@ function getSettingsRoot() {
         ...DEFAULT_AGENT_SETTINGS,
         ...(extension_settings[EXTENSION_ID].agent || {}),
     };
+    normalizeAgentApiPresets(extension_settings[EXTENSION_ID].agent);
 
     if (!Array.isArray(extension_settings[EXTENSION_ID].agent.selectedPresetKeys)) {
         extension_settings[EXTENSION_ID].agent.selectedPresetKeys = [];
@@ -102,6 +104,7 @@ function getAgentSettings() {
     return {
         ...DEFAULT_AGENT_SETTINGS,
         ...settings,
+        apiPresets: settings.apiPresets.map(preset => ({ ...preset })),
         selectedPresetKeys: [...(settings.selectedPresetKeys || [])],
     };
 }
@@ -116,7 +119,59 @@ function saveAgentSettings(nextSettings) {
             ? [...nextSettings.selectedPresetKeys]
             : root.agent.selectedPresetKeys,
     };
+    normalizeAgentApiPresets(root.agent);
     saveSettingsDebounced();
+}
+
+function makeApiPresetId() {
+    return `api-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeApiPresetFromSettings(settings, id = makeApiPresetId(), name = '默认') {
+    return {
+        id,
+        name,
+        endpoint: normalizeAgentBaseEndpoint(settings.endpoint || DEFAULT_AGENT_SETTINGS.endpoint),
+        model: String(settings.model || ''),
+        apiKey: String(settings.apiKey || ''),
+        temperature: Number(settings.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
+        maxTokens: Number(settings.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
+    };
+}
+
+function normalizeApiPreset(preset, fallback = DEFAULT_AGENT_SETTINGS, index = 0) {
+    const safePreset = preset && typeof preset === 'object' ? preset : {};
+    return {
+        id: String(safePreset.id || (index === 0 ? 'default' : makeApiPresetId())),
+        name: String(safePreset.name || (index === 0 ? '默认' : `API 预设 ${index + 1}`)),
+        endpoint: normalizeAgentBaseEndpoint(safePreset.endpoint || fallback.endpoint || DEFAULT_AGENT_SETTINGS.endpoint),
+        model: String(safePreset.model ?? fallback.model ?? ''),
+        apiKey: String(safePreset.apiKey ?? fallback.apiKey ?? ''),
+        temperature: Number(safePreset.temperature ?? fallback.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
+        maxTokens: Number(safePreset.maxTokens ?? fallback.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
+    };
+}
+
+function normalizeAgentApiPresets(agentSettings) {
+    if (!Array.isArray(agentSettings.apiPresets)) {
+        agentSettings.apiPresets = [];
+    }
+
+    agentSettings.apiPresets = agentSettings.apiPresets.map((preset, index) => normalizeApiPreset(preset, agentSettings, index));
+    if (!agentSettings.apiPresets.length) {
+        agentSettings.apiPresets.push(makeApiPresetFromSettings(agentSettings, 'default', '默认'));
+    }
+
+    const activeId = String(agentSettings.activeApiPresetId || agentSettings.apiPresets[0].id);
+    const activePreset = agentSettings.apiPresets.find(preset => preset.id === activeId) || agentSettings.apiPresets[0];
+    agentSettings.activeApiPresetId = activePreset.id;
+    Object.assign(agentSettings, {
+        endpoint: activePreset.endpoint,
+        model: activePreset.model,
+        apiKey: activePreset.apiKey,
+        temperature: activePreset.temperature,
+        maxTokens: activePreset.maxTokens,
+    });
 }
 
 function makeSelectionKey(item, fallbackIndex = '') {
@@ -878,23 +933,6 @@ function buildAgentUserPrompt(selectedItems) {
     ].join('\n');
 }
 
-function normalizeAgentEndpoint(endpoint) {
-    const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
-    if (!trimmed) {
-        return '';
-    }
-
-    if (/\/chat\/completions$/i.test(trimmed)) {
-        return trimmed;
-    }
-
-    if (/\/v1$/i.test(trimmed)) {
-        return `${trimmed}/chat/completions`;
-    }
-
-    return `${trimmed}/v1/chat/completions`;
-}
-
 function normalizeAgentBaseEndpoint(endpoint) {
     const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
     if (!trimmed) {
@@ -920,35 +958,6 @@ function normalizeAgentBaseEndpoint(endpoint) {
     return `${trimmed}/v1`;
 }
 
-function normalizeModelsEndpoint(endpoint) {
-    const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
-    if (!trimmed) {
-        return '';
-    }
-
-    if (/\/models$/i.test(trimmed)) {
-        return trimmed;
-    }
-
-    if (/\/chat\/completions$/i.test(trimmed)) {
-        return trimmed.replace(/\/chat\/completions$/i, '/models');
-    }
-
-    if (/\/completions$/i.test(trimmed)) {
-        return trimmed.replace(/\/completions$/i, '/models');
-    }
-
-    if (/\/v1$/i.test(trimmed)) {
-        return `${trimmed}/models`;
-    }
-
-    return `${trimmed}/v1/models`;
-}
-
-function shouldUseSillyTavernBackend(settings) {
-    return String(settings.requestMode || DEFAULT_AGENT_SETTINGS.requestMode) === 'sillytavern';
-}
-
 function makeSillyTavernBackendPayload(settings, extra = {}) {
     return {
         chat_completion_source: 'openai',
@@ -959,49 +968,8 @@ function makeSillyTavernBackendPayload(settings, extra = {}) {
     };
 }
 
-function makeDirectFetchError(error) {
-    return new Error(`浏览器直连失败：${error?.message || String(error)}。如果 API 是内网 HTTP、未开启 CORS，或酒馆页面是 HTTPS，请把请求方式设为“酒馆后端转发”。`);
-}
-
 async function fetchAvailableModels(settings = getAgentSettings()) {
-    if (shouldUseSillyTavernBackend(settings)) {
-        return fetchAvailableModelsViaSillyTavern(settings);
-    }
-
-    const endpoint = normalizeModelsEndpoint(settings.endpoint);
-    if (!endpoint) {
-        throw new Error('请先填写 API 地址。');
-    }
-
-    const headers = {};
-    if (settings.apiKey) {
-        headers.Authorization = `Bearer ${settings.apiKey}`;
-    }
-
-    let response;
-    try {
-        response = await fetch(endpoint, { headers });
-    } catch (error) {
-        throw makeDirectFetchError(error);
-    }
-    const responseText = await response.text();
-    let payload = null;
-
-    try {
-        payload = responseText ? JSON.parse(responseText) : null;
-    } catch {
-        payload = null;
-    }
-
-    if (!response.ok) {
-        throw new Error(payload?.error?.message || responseText || `模型列表读取失败：HTTP ${response.status}`);
-    }
-
-    const models = Array.isArray(payload?.data)
-        ? payload.data.map(model => model?.id).filter(Boolean)
-        : [];
-
-    return [...new Set(models)].sort((a, b) => a.localeCompare(b));
+    return fetchAvailableModelsViaSillyTavern(settings);
 }
 
 async function fetchAvailableModelsViaSillyTavern(settings = getAgentSettings()) {
@@ -1122,7 +1090,6 @@ async function generateFormatSkillViaSillyTavern(selectedItems, settings, model,
 }
 
 async function generateFormatSkill(selectedItems, settings = getAgentSettings()) {
-    const endpoint = normalizeAgentEndpoint(settings.endpoint);
     const backendEndpoint = normalizeAgentBaseEndpoint(settings.endpoint);
     const model = String(settings.model || '').trim();
 
@@ -1130,7 +1097,7 @@ async function generateFormatSkill(selectedItems, settings = getAgentSettings())
         throw new Error('请先勾选要交给 Agent 分析的预设。');
     }
 
-    if (shouldUseSillyTavernBackend(settings) ? !backendEndpoint : !endpoint) {
+    if (!backendEndpoint) {
         throw new Error('请先配置 Agent API 地址。');
     }
 
@@ -1138,56 +1105,7 @@ async function generateFormatSkill(selectedItems, settings = getAgentSettings())
         throw new Error('请先配置 Agent 模型名。');
     }
 
-    if (shouldUseSillyTavernBackend(settings)) {
-        return generateFormatSkillViaSillyTavern(selectedItems, settings, model, backendEndpoint);
-    }
-
-    const headers = {
-        'Content-Type': 'application/json',
-    };
-
-    if (settings.apiKey) {
-        headers.Authorization = `Bearer ${settings.apiKey}`;
-    }
-
-    let response;
-    try {
-        response = await fetch(endpoint, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                model,
-                messages: [
-                    { role: 'system', content: AGENT_SYSTEM_PROMPT },
-                    { role: 'user', content: buildAgentUserPrompt(selectedItems) },
-                ],
-                temperature: Number(settings.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
-                max_tokens: Number(settings.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
-            }),
-        });
-    } catch (error) {
-        throw makeDirectFetchError(error);
-    }
-
-    const responseText = await response.text();
-    let payload = null;
-
-    try {
-        payload = responseText ? JSON.parse(responseText) : null;
-    } catch {
-        payload = null;
-    }
-
-    if (!response.ok) {
-        throw new Error(payload?.error?.message || responseText || `Agent API 请求失败：HTTP ${response.status}`);
-    }
-
-    const skillText = extractAgentResponseText(payload).trim();
-    if (!skillText) {
-        throw new Error('Agent API 没有返回可用文本。');
-    }
-
-    return rememberFormatSkillResult(skillText, model, endpoint, selectedItems);
+    return generateFormatSkillViaSillyTavern(selectedItems, settings, model, backendEndpoint);
 }
 
 function makePopupHtml() {
@@ -1526,31 +1444,181 @@ function exportCurrent(root) {
     download(safeStringify(payload), `${sanitizeFileName('preset-reader-export')}.json`, 'application/json');
 }
 
+function setAgentSettingsForm(root, preset) {
+    root.find(`#${EXTENSION_ID}-agent-endpoint`).val(normalizeAgentBaseEndpoint(preset.endpoint));
+    root.find(`#${EXTENSION_ID}-agent-model`).val(preset.model || '');
+    root.find(`#${EXTENSION_ID}-agent-api-key`).val(preset.apiKey || '');
+    root.find(`#${EXTENSION_ID}-agent-temperature`).val(preset.temperature ?? DEFAULT_AGENT_SETTINGS.temperature);
+    root.find(`#${EXTENSION_ID}-agent-max-tokens`).val(preset.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens);
+}
+
+function renderApiPresetOptions(root) {
+    const settings = getAgentSettings();
+    const select = root.find(`#${EXTENSION_ID}-agent-api-preset`);
+    select.empty();
+    settings.apiPresets.forEach(preset => {
+        select.append($('<option></option>', { value: preset.id, text: preset.name }));
+    });
+    select.val(settings.activeApiPresetId);
+}
+
+function getActiveApiPreset() {
+    const settings = getAgentSettings();
+    return settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId) || settings.apiPresets[0];
+}
+
+function saveCurrentApiPreset(root) {
+    const formSettings = readAgentSettingsForm(root);
+    const settings = getAgentSettings();
+    const activeId = formSettings.activeApiPresetId || settings.activeApiPresetId;
+    const currentPreset = settings.apiPresets.find(preset => preset.id === activeId) || settings.apiPresets[0];
+    const nextPreset = {
+        ...currentPreset,
+        ...makeApiPresetFromSettings(formSettings, activeId, currentPreset?.name || '默认'),
+    };
+    const nextPresets = settings.apiPresets.map(preset => preset.id === activeId ? nextPreset : preset);
+
+    saveAgentSettings({
+        ...formSettings,
+        activeApiPresetId: activeId,
+        apiPresets: nextPresets,
+    });
+    renderApiPresetOptions(root);
+    toastr.success('API 预设已保存');
+}
+
+function applyApiPresetToForm(root, presetId) {
+    const settings = getAgentSettings();
+    const preset = settings.apiPresets.find(item => item.id === presetId) || settings.apiPresets[0];
+    if (!preset) {
+        return;
+    }
+
+    root.find(`#${EXTENSION_ID}-agent-api-preset`).val(preset.id);
+    setAgentSettingsForm(root, preset);
+    root.data('available-models', []);
+    hideModelOptions(root);
+    saveAgentSettings({
+        activeApiPresetId: preset.id,
+        apiPresets: settings.apiPresets,
+    });
+    loadAgentModelsIntoSettings(root, { silent: true });
+}
+
+function showApiPresetEditor(root) {
+    const settings = getAgentSettings();
+    const preset = getActiveApiPreset();
+    const editor = $(`
+        <div class="preset-reader-api-preset-editor">
+            <label>
+                <span>预设名称</span>
+                <input id="${EXTENSION_ID}-api-preset-name" type="text">
+            </label>
+            <div class="preset-reader-api-preset-editor-actions">
+                <button id="${EXTENSION_ID}-api-preset-rename" class="menu_button" type="button">
+                    <i class="fa-solid fa-pen"></i>
+                    <span>重命名</span>
+                </button>
+                <button id="${EXTENSION_ID}-api-preset-new" class="menu_button" type="button">
+                    <i class="fa-solid fa-plus"></i>
+                    <span>另存为新预设</span>
+                </button>
+                <button id="${EXTENSION_ID}-api-preset-delete" class="menu_button" type="button">
+                    <i class="fa-solid fa-trash"></i>
+                    <span>删除</span>
+                </button>
+            </div>
+        </div>
+    `);
+    editor.find(`#${EXTENSION_ID}-api-preset-name`).val(preset?.name || '默认');
+
+    editor.find(`#${EXTENSION_ID}-api-preset-rename`).on('click', () => {
+        const name = String(editor.find(`#${EXTENSION_ID}-api-preset-name`).val() || '').trim();
+        if (!name) {
+            toastr.warning('请填写预设名称');
+            return;
+        }
+
+        const currentSettings = getAgentSettings();
+        const activeId = String(root.find(`#${EXTENSION_ID}-agent-api-preset`).val() || currentSettings.activeApiPresetId);
+        const activePreset = currentSettings.apiPresets.find(item => item.id === activeId) || currentSettings.apiPresets[0];
+        const nextPresets = currentSettings.apiPresets.map(item => item.id === activePreset.id ? { ...item, name } : item);
+        saveAgentSettings({ activeApiPresetId: activePreset.id, apiPresets: nextPresets });
+        renderApiPresetOptions(root);
+        toastr.success('API 预设已重命名');
+    });
+
+    editor.find(`#${EXTENSION_ID}-api-preset-new`).on('click', () => {
+        const name = String(editor.find(`#${EXTENSION_ID}-api-preset-name`).val() || '').trim() || '新 API 预设';
+        const formSettings = readAgentSettingsForm(root);
+        const currentSettings = getAgentSettings();
+        const id = makeApiPresetId();
+        const nextPreset = makeApiPresetFromSettings(formSettings, id, name);
+        saveAgentSettings({
+            ...formSettings,
+            activeApiPresetId: id,
+            apiPresets: [...currentSettings.apiPresets, nextPreset],
+        });
+        renderApiPresetOptions(root);
+        applyApiPresetToForm(root, id);
+        toastr.success('已另存为新 API 预设');
+    });
+
+    editor.find(`#${EXTENSION_ID}-api-preset-delete`).on('click', () => {
+        const currentSettings = getAgentSettings();
+        const activeId = String(root.find(`#${EXTENSION_ID}-agent-api-preset`).val() || currentSettings.activeApiPresetId);
+        const activePreset = currentSettings.apiPresets.find(item => item.id === activeId) || currentSettings.apiPresets[0];
+        if (currentSettings.apiPresets.length <= 1) {
+            toastr.warning('至少保留一个 API 预设');
+            return;
+        }
+
+        const nextPresets = currentSettings.apiPresets.filter(item => item.id !== activePreset.id);
+        const nextActive = nextPresets[0];
+        saveAgentSettings({ activeApiPresetId: nextActive.id, apiPresets: nextPresets });
+        renderApiPresetOptions(root);
+        applyApiPresetToForm(root, nextActive.id);
+        toastr.success('API 预设已删除');
+    });
+
+    callGenericPopup(editor, POPUP_TYPE.TEXT, '修改 API 预设', {
+        wide: true,
+        allowVerticalScrolling: true,
+    });
+}
+
 function makeAgentSettingsHtml() {
     const settings = getAgentSettings();
     return $(`
         <div class="preset-reader-agent-settings">
             <label>
+                <span>API 预设</span>
+                <div class="preset-reader-api-preset-row">
+                    <select id="${EXTENSION_ID}-agent-api-preset"></select>
+                    <button id="${EXTENSION_ID}-agent-edit-preset" class="menu_button" type="button">
+                        <i class="fa-solid fa-pen-to-square"></i>
+                        <span>修改</span>
+                    </button>
+                    <button id="${EXTENSION_ID}-agent-save-preset" class="menu_button" type="button">
+                        <i class="fa-solid fa-floppy-disk"></i>
+                        <span>保存</span>
+                    </button>
+                </div>
+            </label>
+            <label>
                 <span>API 地址</span>
                 <input id="${EXTENSION_ID}-agent-endpoint" type="text" placeholder="https://api.openai.com/v1">
             </label>
             <label>
-                <span>请求方式</span>
-                <select id="${EXTENSION_ID}-agent-request-mode">
-                    <option value="sillytavern">酒馆后端转发（推荐，支持内网 HTTP）</option>
-                    <option value="browser">浏览器直连（需要 HTTPS/CORS）</option>
-                </select>
-            </label>
-            <label>
                 <span>模型</span>
                 <div class="preset-reader-model-field">
-                    <input id="${EXTENSION_ID}-agent-model" type="text" list="${EXTENSION_ID}-agent-model-list" placeholder="gpt-4.1-mini">
+                    <input id="${EXTENSION_ID}-agent-model" type="text" autocomplete="off" placeholder="gpt-4.1-mini">
                     <button id="${EXTENSION_ID}-agent-refresh-models" class="menu_button" type="button">
                         <i class="fa-solid fa-cloud-arrow-down"></i>
                         <span>获取模型</span>
                     </button>
                 </div>
-                <datalist id="${EXTENSION_ID}-agent-model-list"></datalist>
+                <div id="${EXTENSION_ID}-agent-model-list" class="preset-reader-model-options" hidden></div>
                 <small id="${EXTENSION_ID}-agent-model-status" class="preset-reader-agent-model-status">打开后会自动读取可用模型。</small>
             </label>
             <label>
@@ -1576,8 +1644,8 @@ function makeAgentSettingsHtml() {
         </div>
     `).each((_, root) => {
         const panel = $(root);
+        renderApiPresetOptions(panel);
         panel.find(`#${EXTENSION_ID}-agent-endpoint`).val(normalizeAgentBaseEndpoint(settings.endpoint));
-        panel.find(`#${EXTENSION_ID}-agent-request-mode`).val(settings.requestMode || DEFAULT_AGENT_SETTINGS.requestMode);
         panel.find(`#${EXTENSION_ID}-agent-model`).val(settings.model);
         panel.find(`#${EXTENSION_ID}-agent-api-key`).val(settings.apiKey);
         panel.find(`#${EXTENSION_ID}-agent-temperature`).val(settings.temperature);
@@ -1591,12 +1659,42 @@ function readAgentSettingsForm(root) {
 
     return {
         endpoint: normalizeAgentBaseEndpoint(root.find(`#${EXTENSION_ID}-agent-endpoint`).val()),
-        requestMode: String(root.find(`#${EXTENSION_ID}-agent-request-mode`).val() || DEFAULT_AGENT_SETTINGS.requestMode),
+        activeApiPresetId: String(root.find(`#${EXTENSION_ID}-agent-api-preset`).val() || getAgentSettings().activeApiPresetId),
         model: String(root.find(`#${EXTENSION_ID}-agent-model`).val() || '').trim(),
         apiKey: String(root.find(`#${EXTENSION_ID}-agent-api-key`).val() || '').trim(),
         temperature: Number.isFinite(temperature) ? temperature : DEFAULT_AGENT_SETTINGS.temperature,
         maxTokens: Number.isFinite(maxTokens) ? maxTokens : DEFAULT_AGENT_SETTINGS.maxTokens,
     };
+}
+
+function hideModelOptions(root) {
+    root.find(`#${EXTENSION_ID}-agent-model-list`).prop('hidden', true);
+}
+
+function renderModelOptions(root, models = root.data('available-models') || []) {
+    const input = root.find(`#${EXTENSION_ID}-agent-model`);
+    const list = root.find(`#${EXTENSION_ID}-agent-model-list`);
+    const query = String(input.val() || '').trim().toLowerCase();
+    const filteredModels = models.filter(model => !query || model.toLowerCase().includes(query));
+
+    list.empty();
+    if (!models.length) {
+        list.append($('<div class="preset-reader-model-empty"></div>').text('暂无模型列表'));
+    } else if (!filteredModels.length) {
+        list.append($('<div class="preset-reader-model-empty"></div>').text('没有匹配的模型'));
+    } else {
+        filteredModels.forEach(model => {
+            const option = $('<button class="preset-reader-model-option" type="button"></button>').text(model);
+            option.toggleClass('is-current', model === input.val());
+            option.on('click', () => {
+                input.val(model);
+                hideModelOptions(root);
+            });
+            list.append(option);
+        });
+    }
+
+    list.prop('hidden', false);
 }
 
 async function loadAgentModelsIntoSettings(root, { silent = false } = {}) {
@@ -1615,20 +1713,29 @@ async function loadAgentModelsIntoSettings(root, { silent = false } = {}) {
         button.prop('disabled', true);
         status.text('正在读取可用模型...');
         const models = await fetchAvailableModels(settings);
-        modelList.empty();
-        models.forEach(model => {
-            modelList.append($('<option></option>', { value: model }));
-        });
+        root.data('available-models', models);
 
         if (!modelInput.val() && models.length) {
             modelInput.val(models[0]);
         }
 
         status.text(models.length ? `已读取 ${models.length} 个模型。` : 'API 没有返回模型列表。');
+        if (models.length) {
+            renderModelOptions(root, models);
+            if (silent) {
+                hideModelOptions(root);
+            }
+        } else {
+            modelList.empty();
+            hideModelOptions(root);
+        }
         return models;
     } catch (error) {
         const message = error?.message || String(error);
         status.text(`模型读取失败：${message}`);
+        root.data('available-models', []);
+        modelList.empty();
+        hideModelOptions(root);
         if (!silent) {
             toastr.error(message);
         }
@@ -1649,13 +1756,25 @@ function showAgentSettings() {
         }, 500);
     };
 
-    root.find(`#${EXTENSION_ID}-agent-save`).on('click', () => {
-        saveAgentSettings(readAgentSettingsForm(root));
-        toastr.success('Agent API 配置已保存');
+    root.find(`#${EXTENSION_ID}-agent-api-preset`).on('change', event => applyApiPresetToForm(root, event.target.value));
+    root.find(`#${EXTENSION_ID}-agent-edit-preset`).on('click', () => showApiPresetEditor(root));
+    root.find(`#${EXTENSION_ID}-agent-save-preset, #${EXTENSION_ID}-agent-save`).on('click', () => {
+        saveCurrentApiPreset(root);
         loadAgentModelsIntoSettings(root, { silent: true });
     });
     root.find(`#${EXTENSION_ID}-agent-refresh-models`).on('click', () => loadAgentModelsIntoSettings(root));
-    root.find(`#${EXTENSION_ID}-agent-endpoint, #${EXTENSION_ID}-agent-api-key, #${EXTENSION_ID}-agent-request-mode`).on('change blur', scheduleModelFetch);
+    root.find(`#${EXTENSION_ID}-agent-endpoint, #${EXTENSION_ID}-agent-api-key`).on('change blur', scheduleModelFetch);
+    root.find(`#${EXTENSION_ID}-agent-model`).on('focus input', () => renderModelOptions(root));
+    root.find(`#${EXTENSION_ID}-agent-model`).on('keydown', event => {
+        if (event.key === 'Escape') {
+            hideModelOptions(root);
+        }
+    });
+    root.on('click', event => {
+        if (!$(event.target).closest('.preset-reader-model-field, .preset-reader-model-options').length) {
+            hideModelOptions(root);
+        }
+    });
 
     callGenericPopup(root, POPUP_TYPE.TEXT, 'Preset Reader Agent API', {
         wide: true,

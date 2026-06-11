@@ -829,6 +829,63 @@ function normalizeAgentEndpoint(endpoint) {
     return `${trimmed}/v1/chat/completions`;
 }
 
+function normalizeModelsEndpoint(endpoint) {
+    const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
+    if (!trimmed) {
+        return '';
+    }
+
+    if (/\/models$/i.test(trimmed)) {
+        return trimmed;
+    }
+
+    if (/\/chat\/completions$/i.test(trimmed)) {
+        return trimmed.replace(/\/chat\/completions$/i, '/models');
+    }
+
+    if (/\/completions$/i.test(trimmed)) {
+        return trimmed.replace(/\/completions$/i, '/models');
+    }
+
+    if (/\/v1$/i.test(trimmed)) {
+        return `${trimmed}/models`;
+    }
+
+    return `${trimmed}/v1/models`;
+}
+
+async function fetchAvailableModels(settings = getAgentSettings()) {
+    const endpoint = normalizeModelsEndpoint(settings.endpoint);
+    if (!endpoint) {
+        throw new Error('请先填写 API 地址。');
+    }
+
+    const headers = {};
+    if (settings.apiKey) {
+        headers.Authorization = `Bearer ${settings.apiKey}`;
+    }
+
+    const response = await fetch(endpoint, { headers });
+    const responseText = await response.text();
+    let payload = null;
+
+    try {
+        payload = responseText ? JSON.parse(responseText) : null;
+    } catch {
+        payload = null;
+    }
+
+    if (!response.ok) {
+        throw new Error(payload?.error?.message || responseText || `模型列表读取失败：HTTP ${response.status}`);
+    }
+
+    const models = Array.isArray(payload?.data)
+        ? payload.data.map(model => model?.id).filter(Boolean)
+        : [];
+
+    return [...new Set(models)].sort((a, b) => a.localeCompare(b));
+}
+
 function extractAgentResponseText(payload) {
     if (typeof payload?.output_text === 'string') {
         return payload.output_text;
@@ -1226,7 +1283,15 @@ function makeAgentSettingsHtml() {
             </label>
             <label>
                 <span>模型</span>
-                <input id="${EXTENSION_ID}-agent-model" type="text" placeholder="gpt-4.1-mini">
+                <div class="preset-reader-model-field">
+                    <input id="${EXTENSION_ID}-agent-model" type="text" list="${EXTENSION_ID}-agent-model-list" placeholder="gpt-4.1-mini">
+                    <button id="${EXTENSION_ID}-agent-refresh-models" class="menu_button" type="button">
+                        <i class="fa-solid fa-cloud-arrow-down"></i>
+                        <span>获取模型</span>
+                    </button>
+                </div>
+                <datalist id="${EXTENSION_ID}-agent-model-list"></datalist>
+                <small id="${EXTENSION_ID}-agent-model-status" class="preset-reader-agent-model-status">打开后会自动读取可用模型。</small>
             </label>
             <label>
                 <span>API Key</span>
@@ -1272,17 +1337,70 @@ function readAgentSettingsForm(root) {
     };
 }
 
+async function loadAgentModelsIntoSettings(root, { silent = false } = {}) {
+    const modelInput = root.find(`#${EXTENSION_ID}-agent-model`);
+    const modelList = root.find(`#${EXTENSION_ID}-agent-model-list`);
+    const status = root.find(`#${EXTENSION_ID}-agent-model-status`);
+    const button = root.find(`#${EXTENSION_ID}-agent-refresh-models`);
+    const settings = readAgentSettingsForm(root);
+
+    if (!settings.endpoint) {
+        status.text('请先填写 API 地址。');
+        return [];
+    }
+
+    try {
+        button.prop('disabled', true);
+        status.text('正在读取可用模型...');
+        const models = await fetchAvailableModels(settings);
+        modelList.empty();
+        models.forEach(model => {
+            modelList.append($('<option></option>', { value: model }));
+        });
+
+        if (!modelInput.val() && models.length) {
+            modelInput.val(models[0]);
+        }
+
+        status.text(models.length ? `已读取 ${models.length} 个模型。` : 'API 没有返回模型列表。');
+        return models;
+    } catch (error) {
+        const message = error?.message || String(error);
+        status.text(`模型读取失败：${message}`);
+        if (!silent) {
+            toastr.error(message);
+        }
+        return [];
+    } finally {
+        button.prop('disabled', false);
+    }
+}
+
 function showAgentSettings() {
     const root = makeAgentSettingsHtml();
+    let modelFetchTimer = null;
+
+    const scheduleModelFetch = () => {
+        clearTimeout(modelFetchTimer);
+        modelFetchTimer = setTimeout(() => {
+            loadAgentModelsIntoSettings(root, { silent: true });
+        }, 500);
+    };
+
     root.find(`#${EXTENSION_ID}-agent-save`).on('click', () => {
         saveAgentSettings(readAgentSettingsForm(root));
         toastr.success('Agent API 配置已保存');
+        loadAgentModelsIntoSettings(root, { silent: true });
     });
+    root.find(`#${EXTENSION_ID}-agent-refresh-models`).on('click', () => loadAgentModelsIntoSettings(root));
+    root.find(`#${EXTENSION_ID}-agent-endpoint, #${EXTENSION_ID}-agent-api-key`).on('change blur', scheduleModelFetch);
 
     callGenericPopup(root, POPUP_TYPE.TEXT, 'Preset Reader Agent API', {
         wide: true,
         allowVerticalScrolling: true,
     });
+
+    loadAgentModelsIntoSettings(root, { silent: true });
 }
 
 function showAgentResult(result) {
@@ -1465,6 +1583,7 @@ function exposeApi() {
         getLastFormatSkill: () => clone(lastFormatSkill),
         getAgentSettings,
         saveAgentSettings,
+        fetchAvailableModels,
         generateFormatSkill,
         openAgentSettings: showAgentSettings,
         open: showPresetReader,

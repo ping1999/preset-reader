@@ -210,6 +210,49 @@
     width: 100%;
 }
 
+.preset-reader-agent-settings input,
+#preset-reader-agent-result-text {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 4px;
+    background: var(--black50a, #101826);
+    color: var(--SmartThemeBodyColor, #f4f7fb);
+    caret-color: var(--SmartThemeBodyColor, #f4f7fb);
+}
+
+.preset-reader-agent-settings input::placeholder,
+#preset-reader-agent-result-text::placeholder {
+    color: var(--SmartThemeEmColor, #aeb7c5);
+    opacity: 0.75;
+}
+
+.preset-reader-model-field {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.preset-reader-model-field input {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.preset-reader-model-field .menu_button,
+.preset-reader-agent-settings-actions .menu_button {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: auto;
+    min-width: 96px;
+    white-space: nowrap;
+}
+
+.preset-reader-agent-model-status {
+    min-height: 1.2em;
+    opacity: 0.75;
+}
+
 .preset-reader-agent-settings-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -267,5 +310,10 @@
 
     .preset-reader-agent-settings-grid {
         grid-template-columns: 1fr;
+    }
+
+    .preset-reader-model-field {
+        align-items: stretch;
+        flex-direction: column;
     }
 }

@@ -25,6 +25,8 @@ const DEFAULT_AGENT_SETTINGS = Object.freeze({
     endpoint: 'https://api.openai.com/v1',
     model: '',
     apiKey: '',
+    stream: true,
+    additionalParams: '',
     temperature: 0.2,
     maxTokens: 1800,
     activeApiPresetId: 'default',
@@ -198,9 +200,49 @@ function makeApiPresetFromSettings(settings, id = makeApiPresetId(), name = '默
         endpoint: normalizeAgentBaseEndpoint(settings.endpoint || DEFAULT_AGENT_SETTINGS.endpoint),
         model: String(settings.model || ''),
         apiKey: String(settings.apiKey || ''),
+        stream: normalizeStreamValue(settings.stream),
+        additionalParams: normalizeAdditionalParamsText(settings.additionalParams),
         temperature: Number(settings.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
         maxTokens: Number(settings.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
     };
+}
+
+function normalizeAdditionalParamsText(value) {
+    if (!value) {
+        return '';
+    }
+
+    if (typeof value === 'string') {
+        return value.trim();
+    }
+
+    if (typeof value === 'object') {
+        try {
+            return JSON.stringify(value, null, 2);
+        } catch {
+            return '';
+        }
+    }
+
+    return String(value).trim();
+}
+
+function normalizeStreamValue(value, fallback = DEFAULT_AGENT_SETTINGS.stream) {
+    if (typeof value === 'boolean') {
+        return value;
+    }
+
+    if (typeof value === 'string') {
+        const lowered = value.trim().toLowerCase();
+        if (['false', '0', 'off', 'no'].includes(lowered)) {
+            return false;
+        }
+        if (['true', '1', 'on', 'yes'].includes(lowered)) {
+            return true;
+        }
+    }
+
+    return fallback !== false;
 }
 
 function normalizeApiPreset(preset, fallback = DEFAULT_AGENT_SETTINGS, index = 0) {
@@ -211,6 +253,8 @@ function normalizeApiPreset(preset, fallback = DEFAULT_AGENT_SETTINGS, index = 0
         endpoint: normalizeAgentBaseEndpoint(safePreset.endpoint || fallback.endpoint || DEFAULT_AGENT_SETTINGS.endpoint),
         model: String(safePreset.model ?? fallback.model ?? ''),
         apiKey: String(safePreset.apiKey ?? fallback.apiKey ?? ''),
+        stream: normalizeStreamValue(safePreset.stream, fallback.stream ?? DEFAULT_AGENT_SETTINGS.stream),
+        additionalParams: normalizeAdditionalParamsText(safePreset.additionalParams ?? fallback.additionalParams ?? DEFAULT_AGENT_SETTINGS.additionalParams),
         temperature: Number(safePreset.temperature ?? fallback.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
         maxTokens: Number(safePreset.maxTokens ?? fallback.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
     };
@@ -233,6 +277,8 @@ function normalizeAgentApiPresets(agentSettings) {
         endpoint: activePreset.endpoint,
         model: activePreset.model,
         apiKey: activePreset.apiKey,
+        stream: activePreset.stream,
+        additionalParams: activePreset.additionalParams,
         temperature: activePreset.temperature,
         maxTokens: activePreset.maxTokens,
     });
@@ -1022,12 +1068,28 @@ function normalizeAgentBaseEndpoint(endpoint) {
     return `${trimmed}/v1`;
 }
 
-function makeSillyTavernBackendPayload(settings, extra = {}) {
+function parseAgentAdditionalParams(value) {
+    const text = normalizeAdditionalParamsText(value);
+    if (!text) {
+        return {};
+    }
+
+    const parsed = tryParseJson(text);
+    if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) {
+        throw new Error('附加参数必须是 JSON 对象，例如 {"top_p": 0.9}。');
+    }
+
+    return parsed.value;
+}
+
+function makeSillyTavernBackendPayload(settings, extra = {}, { includeAdditionalParams = false } = {}) {
+    const additionalParams = includeAdditionalParams ? parseAgentAdditionalParams(settings.additionalParams) : {};
     return {
         chat_completion_source: 'openai',
         reverse_proxy: normalizeAgentBaseEndpoint(settings.endpoint),
         proxy_password: settings.apiKey || '',
-        stream: false,
+        stream: normalizeStreamValue(settings.stream),
+        ...additionalParams,
         ...extra,
     };
 }
@@ -1045,7 +1107,7 @@ async function fetchAvailableModelsViaSillyTavern(settings = getAgentSettings())
     const response = await fetch('/api/backends/chat-completions/status', {
         method: 'POST',
         headers: getRequestHeaders(),
-        body: JSON.stringify(makeSillyTavernBackendPayload(settings)),
+        body: JSON.stringify(makeSillyTavernBackendPayload(settings, { stream: false })),
     });
     const responseText = await response.text();
     let payload = null;
@@ -1073,6 +1135,17 @@ function extractAgentResponseText(payload) {
     }
 
     const firstChoice = payload?.choices?.[0];
+    if (typeof firstChoice?.delta?.content === 'string') {
+        return firstChoice.delta.content;
+    }
+
+    if (Array.isArray(firstChoice?.delta?.content)) {
+        return firstChoice.delta.content
+            .map(part => part?.text || part?.content || '')
+            .filter(Boolean)
+            .join('\n');
+    }
+
     if (typeof firstChoice?.message?.content === 'string') {
         return firstChoice.message.content;
     }
@@ -1097,6 +1170,46 @@ function extractAgentResponseText(payload) {
     }
 
     return '';
+}
+
+function extractAgentResponseTextFromSse(responseText) {
+    const parts = [];
+    const lines = String(responseText || '').split(/\r?\n/);
+
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith(':') || line.startsWith('event:')) {
+            continue;
+        }
+
+        const data = line.startsWith('data:') ? line.slice(5).trim() : line;
+        if (!data || data === '[DONE]') {
+            continue;
+        }
+
+        const parsed = tryParseJson(data);
+        if (parsed.ok && parsed.value && typeof parsed.value === 'object') {
+            const chunk = extractAgentResponseText(parsed.value);
+            if (chunk) {
+                parts.push(chunk);
+            }
+            continue;
+        }
+
+        if (!line.startsWith('id:') && !line.startsWith('retry:')) {
+            parts.push(data);
+        }
+    }
+
+    return parts.join('');
+}
+
+function extractAgentResponseTextFromRaw(responseText, payload) {
+    if (payload) {
+        return extractAgentResponseText(payload);
+    }
+
+    return extractAgentResponseTextFromSse(responseText);
 }
 
 function rememberFormatSkillResult(skillText, model, endpoint, selectedItems) {
@@ -1135,7 +1248,8 @@ async function generateFormatSkillViaSillyTavern(selectedItems, settings, model,
             ],
             temperature: Number(settings.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
             max_tokens: Number(settings.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
-        })),
+            stream: normalizeStreamValue(settings.stream),
+        }, { includeAdditionalParams: true })),
     });
 
     const responseText = await response.text();
@@ -1151,7 +1265,7 @@ async function generateFormatSkillViaSillyTavern(selectedItems, settings, model,
         throw new Error(payload?.error?.message || payload?.message || responseText || `Agent API 请求失败：HTTP ${response.status}`);
     }
 
-    const skillText = extractAgentResponseText(payload).trim();
+    const skillText = extractAgentResponseTextFromRaw(responseText, payload).trim();
     if (!skillText) {
         throw new Error('Agent API 没有返回可用文本。');
     }
@@ -1499,8 +1613,10 @@ function setAgentSettingsForm(root, preset) {
     root.find(`#${EXTENSION_ID}-agent-endpoint`).val(normalizeAgentBaseEndpoint(preset.endpoint));
     root.find(`#${EXTENSION_ID}-agent-model`).val(preset.model || '');
     root.find(`#${EXTENSION_ID}-agent-api-key`).val(preset.apiKey || '');
+    root.find(`#${EXTENSION_ID}-agent-stream`).prop('checked', normalizeStreamValue(preset.stream));
     root.find(`#${EXTENSION_ID}-agent-temperature`).val(preset.temperature ?? DEFAULT_AGENT_SETTINGS.temperature);
     root.find(`#${EXTENSION_ID}-agent-max-tokens`).val(preset.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens);
+    root.find(`#${EXTENSION_ID}-agent-additional-params`).val(preset.additionalParams || '');
 }
 
 function renderApiPresetOptions(root) {
@@ -1520,6 +1636,13 @@ function getActiveApiPreset() {
 
 function saveCurrentApiPreset(root) {
     const formSettings = readAgentSettingsForm(root);
+    try {
+        parseAgentAdditionalParams(formSettings.additionalParams);
+    } catch (error) {
+        toastr.error(error?.message || String(error));
+        return;
+    }
+
     const settings = getAgentSettings();
     const activeId = formSettings.activeApiPresetId || settings.activeApiPresetId;
     const currentPreset = settings.apiPresets.find(preset => preset.id === activeId) || settings.apiPresets[0];
@@ -1676,6 +1799,10 @@ function makeAgentSettingsHtml() {
                 <span>API Key</span>
                 <input id="${EXTENSION_ID}-agent-api-key" type="password" autocomplete="off">
             </label>
+            <label class="preset-reader-agent-checkbox">
+                <input id="${EXTENSION_ID}-agent-stream" type="checkbox">
+                <span>流式响应</span>
+            </label>
             <div class="preset-reader-agent-settings-grid">
                 <label>
                     <span>Temperature</span>
@@ -1686,6 +1813,11 @@ function makeAgentSettingsHtml() {
                     <input id="${EXTENSION_ID}-agent-max-tokens" type="number" min="256" max="32000" step="128">
                 </label>
             </div>
+            <label>
+                <span>附加参数（JSON）</span>
+                <textarea id="${EXTENSION_ID}-agent-additional-params" rows="5" spellcheck="false" placeholder='{"top_p": 0.9, "presence_penalty": 0}'></textarea>
+                <small>仅用于生成 Skill 的请求，会合并到酒馆后端请求体。</small>
+            </label>
         </div>
     `).each((_, root) => {
         const panel = $(root);
@@ -1693,8 +1825,10 @@ function makeAgentSettingsHtml() {
         panel.find(`#${EXTENSION_ID}-agent-endpoint`).val(normalizeAgentBaseEndpoint(settings.endpoint));
         panel.find(`#${EXTENSION_ID}-agent-model`).val(settings.model);
         panel.find(`#${EXTENSION_ID}-agent-api-key`).val(settings.apiKey);
+        panel.find(`#${EXTENSION_ID}-agent-stream`).prop('checked', normalizeStreamValue(settings.stream));
         panel.find(`#${EXTENSION_ID}-agent-temperature`).val(settings.temperature);
         panel.find(`#${EXTENSION_ID}-agent-max-tokens`).val(settings.maxTokens);
+        panel.find(`#${EXTENSION_ID}-agent-additional-params`).val(settings.additionalParams || '');
     });
 }
 
@@ -1707,6 +1841,8 @@ function readAgentSettingsForm(root) {
         activeApiPresetId: String(root.find(`#${EXTENSION_ID}-agent-api-preset`).val() || getAgentSettings().activeApiPresetId),
         model: String(root.find(`#${EXTENSION_ID}-agent-model`).val() || '').trim(),
         apiKey: String(root.find(`#${EXTENSION_ID}-agent-api-key`).val() || '').trim(),
+        stream: root.find(`#${EXTENSION_ID}-agent-stream`).prop('checked'),
+        additionalParams: normalizeAdditionalParamsText(root.find(`#${EXTENSION_ID}-agent-additional-params`).val()),
         temperature: Number.isFinite(temperature) ? temperature : DEFAULT_AGENT_SETTINGS.temperature,
         maxTokens: Number.isFinite(maxTokens) ? maxTokens : DEFAULT_AGENT_SETTINGS.maxTokens,
     };

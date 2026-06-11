@@ -1,4 +1,13 @@
-import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
+import {
+    chat,
+    eventSource,
+    event_types,
+    getCurrentChatId,
+    getRequestHeaders,
+    saveChatConditional,
+    saveSettingsDebounced,
+    updateMessageBlock,
+} from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
@@ -20,6 +29,16 @@ const AGENT_SYSTEM_PROMPT = `你是“预设格式修复 Skill 生成 Agent”�
 你要输出一份可直接交给另一个 AI 使用的“格式修复 skill/提示词”。这份 skill 用来处理已经生成但没有遵守格式的文本：在不改写事实、不扩写剧情、不新增设定的前提下，重新补齐格式、标签、顺序和分段。
 输出必须是中文，必须只交付最终 skill/提示词正文，不要解释你如何分析，不要输出对用户预设内容的总结。
 如果预设要求使用成对标签，例如 <dm_set>...</dm_set>，必须在 skill 中明确要求保留并补齐这类标签。`;
+const FORMAT_REPAIR_SYSTEM_PROMPT = `你是“消息格式修复执行器”。
+你的任务是严格按照用户提供的格式修复 Skill，修复一条已经生成但格式不合规的消息。
+只允许补齐格式、标签、包裹结构、章节顺序、字段名、换行和排版要求。
+禁止新增事实、剧情、角色动作、设定、解释或总结。
+必须保留原消息的事实、语义、角色关系、时间线和信息量。
+最终只输出修复后的消息正文，不要解释修复过程，不要输出前后对比。`;
+const TASK_API_PRESET_LABELS = Object.freeze({
+    generateSkill: '生成 Skill',
+    repairFormat: '修复格式',
+});
 
 const DEFAULT_AGENT_SETTINGS = Object.freeze({
     endpoint: 'https://api.openai.com/v1',
@@ -31,6 +50,10 @@ const DEFAULT_AGENT_SETTINGS = Object.freeze({
     maxTokens: 1800,
     activeApiPresetId: 'default',
     apiPresets: [],
+    taskApiPresetIds: {
+        generateSkill: 'default',
+        repairFormat: 'default',
+    },
     selectedPresetKeys: [],
     generatedSkills: [],
 });
@@ -39,6 +62,9 @@ let lastSnapshot = null;
 let lastFormatSkill = null;
 let menuInitialized = false;
 let commandsInitialized = false;
+let messageButtonsInitialized = false;
+let messageButtonObserver = null;
+let messageButtonInjectTimer = null;
 
 function clone(value) {
     if (typeof structuredClone === 'function') {
@@ -94,6 +120,7 @@ function getSettingsRoot() {
         ...(extension_settings[EXTENSION_ID].agent || {}),
     };
     normalizeAgentApiPresets(extension_settings[EXTENSION_ID].agent);
+    normalizeTaskApiPresetIds(extension_settings[EXTENSION_ID].agent);
 
     if (!Array.isArray(extension_settings[EXTENSION_ID].agent.selectedPresetKeys)) {
         extension_settings[EXTENSION_ID].agent.selectedPresetKeys = [];
@@ -110,6 +137,7 @@ function getAgentSettings() {
         ...DEFAULT_AGENT_SETTINGS,
         ...settings,
         apiPresets: settings.apiPresets.map(preset => ({ ...preset })),
+        taskApiPresetIds: { ...settings.taskApiPresetIds },
         selectedPresetKeys: [...(settings.selectedPresetKeys || [])],
         generatedSkills: settings.generatedSkills.map(skill => ({
             ...skill,
@@ -127,11 +155,15 @@ function saveAgentSettings(nextSettings) {
         selectedPresetKeys: Array.isArray(nextSettings.selectedPresetKeys)
             ? [...nextSettings.selectedPresetKeys].slice(0, 1)
             : root.agent.selectedPresetKeys,
+        taskApiPresetIds: nextSettings.taskApiPresetIds && typeof nextSettings.taskApiPresetIds === 'object'
+            ? { ...root.agent.taskApiPresetIds, ...nextSettings.taskApiPresetIds }
+            : root.agent.taskApiPresetIds,
         generatedSkills: Array.isArray(nextSettings.generatedSkills)
             ? nextSettings.generatedSkills
             : root.agent.generatedSkills,
     };
     normalizeAgentApiPresets(root.agent);
+    normalizeTaskApiPresetIds(root.agent);
     normalizeGeneratedSkills(root.agent);
     saveSettingsDebounced();
 }
@@ -282,6 +314,41 @@ function normalizeAgentApiPresets(agentSettings) {
         temperature: activePreset.temperature,
         maxTokens: activePreset.maxTokens,
     });
+}
+
+function normalizeTaskApiPresetIds(agentSettings) {
+    const validIds = new Set(agentSettings.apiPresets.map(preset => preset.id));
+    const firstId = agentSettings.apiPresets[0]?.id || 'default';
+    const current = agentSettings.taskApiPresetIds && typeof agentSettings.taskApiPresetIds === 'object'
+        ? agentSettings.taskApiPresetIds
+        : {};
+
+    agentSettings.taskApiPresetIds = {};
+    Object.keys(TASK_API_PRESET_LABELS).forEach(task => {
+        const presetId = String(current[task] || agentSettings.activeApiPresetId || firstId);
+        agentSettings.taskApiPresetIds[task] = validIds.has(presetId) ? presetId : firstId;
+    });
+}
+
+function getAgentSettingsForTask(task) {
+    const settings = getAgentSettings();
+    const presetId = settings.taskApiPresetIds?.[task] || settings.activeApiPresetId;
+    const preset = settings.apiPresets.find(item => item.id === presetId)
+        || settings.apiPresets.find(item => item.id === settings.activeApiPresetId)
+        || settings.apiPresets[0];
+
+    return {
+        ...settings,
+        ...(preset || {}),
+        activeApiPresetId: preset?.id || settings.activeApiPresetId,
+        apiPresets: settings.apiPresets,
+        taskApiPresetIds: { ...settings.taskApiPresetIds },
+        selectedPresetKeys: [...settings.selectedPresetKeys],
+        generatedSkills: settings.generatedSkills.map(skill => ({
+            ...skill,
+            selectedPresets: skill.selectedPresets.map(selectedPreset => ({ ...selectedPreset })),
+        })),
+    };
 }
 
 function makeSelectionKey(item, fallbackIndex = '') {
@@ -1273,7 +1340,7 @@ async function generateFormatSkillViaSillyTavern(selectedItems, settings, model,
     return rememberFormatSkillResult(skillText, model, endpoint, selectedItems);
 }
 
-async function generateFormatSkill(selectedItems, settings = getAgentSettings()) {
+async function generateFormatSkill(selectedItems, settings = getAgentSettingsForTask('generateSkill')) {
     const backendEndpoint = normalizeAgentBaseEndpoint(settings.endpoint);
     const model = String(settings.model || '').trim();
 
@@ -1296,13 +1363,91 @@ async function generateFormatSkill(selectedItems, settings = getAgentSettings())
     return generateFormatSkillViaSillyTavern(selectedItems, settings, model, backendEndpoint);
 }
 
+function buildFormatRepairUserPrompt(skill, messageText) {
+    return [
+        '请使用下面的“格式修复 Skill”修复这条消息。',
+        '',
+        '要求：',
+        '- 只修复格式，不改写事实。',
+        '- 不新增剧情、角色动作、设定或解释。',
+        '- 保留原消息的信息量、语义和顺序，除非 Skill 明确要求调整章节/标签顺序。',
+        '- 最终只输出修复后的消息正文。',
+        '',
+        '## 格式修复 Skill',
+        '```text',
+        String(skill || '').trim(),
+        '```',
+        '',
+        '## 待修复消息',
+        '```text',
+        String(messageText || '').trim(),
+        '```',
+    ].join('\n');
+}
+
+async function repairMessageFormatWithSkill(messageText, skill, settings = getAgentSettingsForTask('repairFormat')) {
+    const backendEndpoint = normalizeAgentBaseEndpoint(settings.endpoint);
+    const model = String(settings.model || '').trim();
+
+    if (!String(messageText || '').trim()) {
+        throw new Error('这条消息没有可修复的正文。');
+    }
+
+    if (!String(skill || '').trim()) {
+        throw new Error('请选择一个可用的 Skill。');
+    }
+
+    if (!backendEndpoint) {
+        throw new Error('请先配置修复格式任务的 API 地址。');
+    }
+
+    if (!model) {
+        throw new Error('请先配置修复格式任务的模型名。');
+    }
+
+    const response = await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(makeSillyTavernBackendPayload(settings, {
+            model,
+            messages: [
+                { role: 'system', content: FORMAT_REPAIR_SYSTEM_PROMPT },
+                { role: 'user', content: buildFormatRepairUserPrompt(skill, messageText) },
+            ],
+            temperature: Number(settings.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
+            max_tokens: Number(settings.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
+            stream: normalizeStreamValue(settings.stream),
+        }, { includeAdditionalParams: true })),
+    });
+
+    const responseText = await response.text();
+    let payload = null;
+
+    try {
+        payload = responseText ? JSON.parse(responseText) : null;
+    } catch {
+        payload = null;
+    }
+
+    if (!response.ok || payload?.error) {
+        throw new Error(payload?.error?.message || payload?.message || responseText || `格式修复请求失败：HTTP ${response.status}`);
+    }
+
+    const repairedText = extractAgentResponseTextFromRaw(responseText, payload).trim();
+    if (!repairedText) {
+        throw new Error('格式修复 API 没有返回可用文本。');
+    }
+
+    return repairedText;
+}
+
 function makePopupHtml() {
     return $(`
         <div id="${EXTENSION_ID}-panel" class="preset-reader-panel">
             <div class="preset-reader-toolbar">
                 <button id="${EXTENSION_ID}-agent-settings" class="menu_button">
                     <i class="fa-solid fa-key"></i>
-                    <span>Agent API</span>
+                    <span>API 设置</span>
                 </button>
                 <button id="${EXTENSION_ID}-saved-skills" class="menu_button">
                     <i class="fa-solid fa-folder-open"></i>
@@ -1627,6 +1772,33 @@ function renderApiPresetOptions(root) {
         select.append($('<option></option>', { value: preset.id, text: preset.name }));
     });
     select.val(settings.activeApiPresetId);
+    renderTaskApiPresetOptions(root);
+}
+
+function renderTaskApiPresetOptions(root) {
+    const settings = getAgentSettings();
+    Object.entries(TASK_API_PRESET_LABELS).forEach(([task]) => {
+        const select = root.find(`[data-preset-reader-task-api="${task}"]`);
+        if (!select.length) {
+            return;
+        }
+
+        select.empty();
+        settings.apiPresets.forEach(preset => {
+            select.append($('<option></option>', { value: preset.id, text: preset.name }));
+        });
+        select.val(settings.taskApiPresetIds?.[task] || settings.activeApiPresetId);
+    });
+}
+
+function saveTaskApiPreset(root, task, presetId) {
+    saveAgentSettings({
+        taskApiPresetIds: {
+            [task]: presetId,
+        },
+    });
+    renderTaskApiPresetOptions(root);
+    toastr.success(`${TASK_API_PRESET_LABELS[task]} 已使用该 API 预设`);
 }
 
 function getActiveApiPreset() {
@@ -1765,59 +1937,76 @@ function makeAgentSettingsHtml() {
     const settings = getAgentSettings();
     return $(`
         <div class="preset-reader-agent-settings">
-            <label>
-                <span>API 预设</span>
-                <div class="preset-reader-api-preset-row">
-                    <select id="${EXTENSION_ID}-agent-api-preset"></select>
-                    <button id="${EXTENSION_ID}-agent-edit-preset" class="menu_button" type="button">
-                        <i class="fa-solid fa-pen-to-square"></i>
-                        <span>修改</span>
-                    </button>
-                    <button id="${EXTENSION_ID}-agent-save-preset" class="menu_button" type="button">
-                        <i class="fa-solid fa-floppy-disk"></i>
-                        <span>保存</span>
-                    </button>
-                </div>
-            </label>
-            <label>
-                <span>API 地址</span>
-                <input id="${EXTENSION_ID}-agent-endpoint" type="text" placeholder="https://api.openai.com/v1">
-            </label>
-            <label>
-                <span>模型</span>
-                <div class="preset-reader-model-field">
-                    <input id="${EXTENSION_ID}-agent-model" type="text" autocomplete="off" placeholder="gpt-4.1-mini">
-                    <button id="${EXTENSION_ID}-agent-refresh-models" class="menu_button" type="button">
-                        <i class="fa-solid fa-cloud-arrow-down"></i>
-                        <span>获取模型</span>
-                    </button>
-                </div>
-                <div id="${EXTENSION_ID}-agent-model-list" class="preset-reader-model-options" hidden></div>
-                <small id="${EXTENSION_ID}-agent-model-status" class="preset-reader-agent-model-status">打开后会自动读取可用模型。</small>
-            </label>
-            <label>
-                <span>API Key</span>
-                <input id="${EXTENSION_ID}-agent-api-key" type="password" autocomplete="off">
-            </label>
-            <label class="preset-reader-agent-checkbox">
-                <input id="${EXTENSION_ID}-agent-stream" type="checkbox">
-                <span>流式响应</span>
-            </label>
-            <div class="preset-reader-agent-settings-grid">
+            <section class="preset-reader-agent-section">
+                <h3>API 预设</h3>
                 <label>
-                    <span>Temperature</span>
-                    <input id="${EXTENSION_ID}-agent-temperature" type="number" min="0" max="2" step="0.1">
+                    <span>API 预设</span>
+                    <div class="preset-reader-api-preset-row">
+                        <select id="${EXTENSION_ID}-agent-api-preset"></select>
+                        <button id="${EXTENSION_ID}-agent-edit-preset" class="menu_button" type="button">
+                            <i class="fa-solid fa-pen-to-square"></i>
+                            <span>修改</span>
+                        </button>
+                        <button id="${EXTENSION_ID}-agent-save-preset" class="menu_button" type="button">
+                            <i class="fa-solid fa-floppy-disk"></i>
+                            <span>保存</span>
+                        </button>
+                    </div>
                 </label>
                 <label>
-                    <span>Max Tokens</span>
-                    <input id="${EXTENSION_ID}-agent-max-tokens" type="number" min="256" max="32000" step="128">
+                    <span>API 地址</span>
+                    <input id="${EXTENSION_ID}-agent-endpoint" type="text" placeholder="https://api.openai.com/v1">
                 </label>
-            </div>
-            <label>
-                <span>附加参数（JSON）</span>
-                <textarea id="${EXTENSION_ID}-agent-additional-params" rows="5" spellcheck="false" placeholder='{"top_p": 0.9, "presence_penalty": 0}'></textarea>
-                <small>仅用于生成 Skill 的请求，会合并到酒馆后端请求体。</small>
-            </label>
+                <label>
+                    <span>模型</span>
+                    <div class="preset-reader-model-field">
+                        <input id="${EXTENSION_ID}-agent-model" type="text" autocomplete="off" placeholder="gpt-4.1-mini">
+                        <button id="${EXTENSION_ID}-agent-refresh-models" class="menu_button" type="button">
+                            <i class="fa-solid fa-cloud-arrow-down"></i>
+                            <span>获取模型</span>
+                        </button>
+                    </div>
+                    <div id="${EXTENSION_ID}-agent-model-list" class="preset-reader-model-options" hidden></div>
+                    <small id="${EXTENSION_ID}-agent-model-status" class="preset-reader-agent-model-status">打开后会自动读取可用模型。</small>
+                </label>
+                <label>
+                    <span>API Key</span>
+                    <input id="${EXTENSION_ID}-agent-api-key" type="password" autocomplete="off">
+                </label>
+                <label class="preset-reader-agent-checkbox">
+                    <input id="${EXTENSION_ID}-agent-stream" type="checkbox">
+                    <span>流式响应</span>
+                </label>
+                <div class="preset-reader-agent-settings-grid">
+                    <label>
+                        <span>Temperature</span>
+                        <input id="${EXTENSION_ID}-agent-temperature" type="number" min="0" max="2" step="0.1">
+                    </label>
+                    <label>
+                        <span>Max Tokens</span>
+                        <input id="${EXTENSION_ID}-agent-max-tokens" type="number" min="256" max="32000" step="128">
+                    </label>
+                </div>
+                <label>
+                    <span>附加参数（JSON）</span>
+                    <textarea id="${EXTENSION_ID}-agent-additional-params" rows="5" spellcheck="false" placeholder='{"top_p": 0.9, "presence_penalty": 0}'></textarea>
+                    <small>仅用于生成请求，会合并到酒馆后端请求体。</small>
+                </label>
+            </section>
+            <section class="preset-reader-agent-section">
+                <h3>任务使用预设</h3>
+                <div class="preset-reader-task-api-grid">
+                    <label>
+                        <span>生成 Skill</span>
+                        <select data-preset-reader-task-api="generateSkill"></select>
+                    </label>
+                    <label>
+                        <span>修复格式</span>
+                        <select data-preset-reader-task-api="repairFormat"></select>
+                    </label>
+                </div>
+                <small>两个任务可以使用不同的 API 地址、模型和附加参数。</small>
+            </section>
         </div>
     `).each((_, root) => {
         const panel = $(root);
@@ -1939,6 +2128,9 @@ function showAgentSettings() {
 
     root.find(`#${EXTENSION_ID}-agent-api-preset`).on('change', event => applyApiPresetToForm(root, event.target.value));
     root.find(`#${EXTENSION_ID}-agent-edit-preset`).on('click', () => showApiPresetEditor(root));
+    root.find('[data-preset-reader-task-api]').on('change', event => {
+        saveTaskApiPreset(root, event.target.dataset.presetReaderTaskApi, event.target.value);
+    });
     root.find(`#${EXTENSION_ID}-agent-save-preset`).on('click', () => {
         saveCurrentApiPreset(root);
         loadAgentModelsIntoSettings(root, { silent: true });
@@ -1957,7 +2149,7 @@ function showAgentSettings() {
         }
     });
 
-    callGenericPopup(root, POPUP_TYPE.TEXT, 'Preset Reader Agent API', {
+    callGenericPopup(root, POPUP_TYPE.TEXT, 'Preset Reader API 设置', {
         wide: true,
         allowVerticalScrolling: true,
     });
@@ -1989,6 +2181,206 @@ function getSavedSkillSourceText(skill) {
     }
 
     return `${preset.sourceLabel || preset.source} / ${preset.kindLabel || preset.kind}`;
+}
+
+function ensureMessageExtra(message) {
+    if (!message.extra || typeof message.extra !== 'object') {
+        message.extra = {};
+    }
+
+    return message.extra;
+}
+
+function getMessageTextForRepair(message) {
+    return String(message?.extra?.display_text ?? message?.mes ?? '');
+}
+
+function backupOriginalMessage(message, skill) {
+    const extra = ensureMessageExtra(message);
+    if (extra.presetReaderOriginal) {
+        return;
+    }
+
+    extra.presetReaderOriginal = {
+        savedAt: new Date().toISOString(),
+        chatId: getCurrentChatId() || '',
+        skillId: skill?.id || '',
+        skillName: skill?.name || '',
+        mes: String(message.mes || ''),
+        hasDisplayText: Object.hasOwn(extra, 'display_text'),
+        displayText: Object.hasOwn(extra, 'display_text') ? String(extra.display_text ?? '') : '',
+        swipeId: Number.isInteger(message.swipe_id) ? message.swipe_id : null,
+        swipes: Array.isArray(message.swipes) ? [...message.swipes] : null,
+    };
+}
+
+function syncCurrentSwipeText(message, text) {
+    if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id) && message.swipes[message.swipe_id] !== undefined) {
+        message.swipes[message.swipe_id] = text;
+    }
+}
+
+async function applyMessageRepair(messageId, repairedText, skill) {
+    const message = chat[messageId];
+    if (!message) {
+        throw new Error('找不到这条消息。');
+    }
+
+    backupOriginalMessage(message, skill);
+    const extra = ensureMessageExtra(message);
+    const hadDisplayText = Object.hasOwn(extra, 'display_text');
+    message.mes = repairedText;
+    if (hadDisplayText) {
+        extra.display_text = repairedText;
+    }
+    extra.presetReaderLastRepair = {
+        repairedAt: new Date().toISOString(),
+        skillId: skill.id,
+        skillName: skill.name,
+    };
+    syncCurrentSwipeText(message, repairedText);
+
+    updateMessageBlock(messageId, message);
+    await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+    await saveChatConditional();
+    scheduleMessageButtonInjection();
+}
+
+async function rollbackMessageRepair(messageId) {
+    const message = chat[messageId];
+    const backup = message?.extra?.presetReaderOriginal;
+    if (!message || !backup) {
+        throw new Error('这条消息没有可回滚的原始内容。');
+    }
+
+    const extra = ensureMessageExtra(message);
+    message.mes = String(backup.mes || '');
+    if (backup.hasDisplayText) {
+        extra.display_text = String(backup.displayText || '');
+    } else {
+        delete extra.display_text;
+    }
+
+    if (Array.isArray(backup.swipes)) {
+        message.swipes = [...backup.swipes];
+    } else {
+        syncCurrentSwipeText(message, message.mes);
+    }
+    if (Number.isInteger(backup.swipeId)) {
+        message.swipe_id = backup.swipeId;
+    }
+
+    delete extra.presetReaderOriginal;
+    delete extra.presetReaderLastRepair;
+    updateMessageBlock(messageId, message);
+    await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+    await saveChatConditional();
+    scheduleMessageButtonInjection();
+}
+
+function getMessageRepairButton(messageId) {
+    return $(`#chat .mes[mesid="${messageId}"] .preset-reader-format-repair`);
+}
+
+async function repairChatMessageWithSkill(messageId, skill) {
+    const message = chat[messageId];
+    if (!message) {
+        throw new Error('找不到这条消息。');
+    }
+
+    const sourceText = getMessageTextForRepair(message);
+    const button = getMessageRepairButton(messageId);
+    button.addClass('fa-spin').attr('title', '格式修复中...');
+    try {
+        const repairedText = await repairMessageFormatWithSkill(sourceText, skill.skill);
+        await applyMessageRepair(messageId, repairedText, skill);
+        toastr.success('消息格式已修复，原始消息已保存，可随时回滚');
+    } finally {
+        button.removeClass('fa-spin').attr('title', '格式修复');
+    }
+}
+
+function getMessageBlockId(element) {
+    const messageId = Number($(element).closest('.mes[mesid]').attr('mesid'));
+    return Number.isInteger(messageId) ? messageId : null;
+}
+
+function injectMessageRepairButtons() {
+    $('#chat .mes[mesid]').each((_, element) => {
+        const messageId = getMessageBlockId(element);
+        if (!Number.isInteger(messageId) || !chat[messageId]) {
+            return;
+        }
+
+        const messageBlock = $(element);
+        const extraButtons = messageBlock.find('.extraMesButtons').first();
+        if (!extraButtons.length || extraButtons.find('.preset-reader-format-repair').length) {
+            return;
+        }
+
+        const button = $(`
+            <div title="格式修复"
+                 aria-label="格式修复"
+                 class="mes_button preset-reader-format-repair fa-solid fa-wand-magic-sparkles"
+                 data-i18n="[title]格式修复"></div>
+        `);
+        extraButtons.prepend(button);
+    });
+}
+
+function ensureMessageButtonObserver() {
+    const chatNode = document.getElementById('chat');
+    if (!chatNode || messageButtonObserver || typeof MutationObserver === 'undefined') {
+        return;
+    }
+
+    messageButtonObserver = new MutationObserver(scheduleMessageButtonInjection);
+    messageButtonObserver.observe(chatNode, {
+        childList: true,
+        subtree: true,
+    });
+}
+
+function scheduleMessageButtonInjection() {
+    clearTimeout(messageButtonInjectTimer);
+    messageButtonInjectTimer = setTimeout(() => {
+        ensureMessageButtonObserver();
+        injectMessageRepairButtons();
+    }, 50);
+}
+
+function initMessageRepairButtons() {
+    if (messageButtonsInitialized) {
+        return;
+    }
+
+    messageButtonsInitialized = true;
+    $(document).on('click', '.preset-reader-format-repair', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        const messageId = getMessageBlockId(event.currentTarget);
+        if (!Number.isInteger(messageId)) {
+            toastr.error('找不到这条消息。');
+            return;
+        }
+
+        showMessageRepairPopup(messageId);
+    });
+
+    [
+        event_types.APP_READY,
+        event_types.CHAT_CHANGED,
+        event_types.CHAT_LOADED,
+        event_types.MORE_MESSAGES_LOADED,
+        event_types.MESSAGE_UPDATED,
+        event_types.MESSAGE_SWIPED,
+        event_types.MESSAGE_SENT,
+        event_types.MESSAGE_RECEIVED,
+        event_types.USER_MESSAGE_RENDERED,
+        event_types.CHARACTER_MESSAGE_RENDERED,
+    ].forEach(eventType => eventSource.on(eventType, scheduleMessageButtonInjection));
+
+    scheduleMessageButtonInjection();
 }
 
 function getFileBaseName(fileName) {
@@ -2025,6 +2417,90 @@ function makeImportedSkill(rawText, fileName, existingSkills) {
                 name,
             }],
         skill: skillText,
+    });
+}
+
+function showMessageRepairPopup(messageId) {
+    const message = chat[messageId];
+    if (!message) {
+        toastr.error('找不到这条消息');
+        return;
+    }
+
+    const skills = getGeneratedSkills();
+    if (!skills.length) {
+        toastr.warning('还没有保存的 Skill，请先生成或导入 Skill');
+        showSavedSkillsBrowser();
+        return;
+    }
+
+    const hasBackup = Boolean(message.extra?.presetReaderOriginal);
+    const root = $(`
+        <div class="preset-reader-message-repair">
+            <label>
+                <span>选择 Skill</span>
+                <select id="${EXTENSION_ID}-message-repair-skill"></select>
+            </label>
+            <div id="${EXTENSION_ID}-message-repair-meta" class="preset-reader-skill-browser-meta"></div>
+            <textarea id="${EXTENSION_ID}-message-repair-preview" readonly></textarea>
+            <div class="preset-reader-message-repair-actions">
+                <button id="${EXTENSION_ID}-message-repair-confirm" class="menu_button" type="button">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i>
+                    <span>确定</span>
+                </button>
+                <button id="${EXTENSION_ID}-message-repair-rollback" class="menu_button" type="button">
+                    <i class="fa-solid fa-rotate-left"></i>
+                    <span>回滚原始消息</span>
+                </button>
+            </div>
+        </div>
+    `);
+
+    const skillSelect = root.find(`#${EXTENSION_ID}-message-repair-skill`);
+    skills.forEach(skill => {
+        skillSelect.append($('<option></option>', { value: skill.id, text: skill.name }));
+    });
+
+    const renderSkillPreview = () => {
+        const skill = skills.find(item => item.id === skillSelect.val()) || skills[0];
+        root.find(`#${EXTENSION_ID}-message-repair-meta`).text(`${getSavedSkillSourceText(skill)} / ${skill.model || '未记录模型'} / ${formatSavedSkillDate(skill.generatedAt)}`);
+        root.find(`#${EXTENSION_ID}-message-repair-preview`).val(skill.skill);
+    };
+
+    root.find(`#${EXTENSION_ID}-message-repair-rollback`).prop('disabled', !hasBackup);
+    skillSelect.on('change', renderSkillPreview);
+    root.find(`#${EXTENSION_ID}-message-repair-confirm`).on('click', async () => {
+        const skill = skills.find(item => item.id === skillSelect.val()) || skills[0];
+        const button = root.find(`#${EXTENSION_ID}-message-repair-confirm`);
+        try {
+            button.prop('disabled', true).find('span').text('修复中...');
+            await repairChatMessageWithSkill(messageId, skill);
+            root.find(`#${EXTENSION_ID}-message-repair-rollback`).prop('disabled', false);
+        } catch (error) {
+            toastr.error(error?.message || String(error));
+        } finally {
+            button.prop('disabled', false).find('span').text('确定');
+        }
+    });
+    root.find(`#${EXTENSION_ID}-message-repair-rollback`).on('click', async () => {
+        if (!confirm('回滚到这条消息第一次修复前的原始内容？')) {
+            return;
+        }
+
+        try {
+            await rollbackMessageRepair(messageId);
+            toastr.success('已回滚到原始消息');
+            root.find(`#${EXTENSION_ID}-message-repair-rollback`).prop('disabled', true);
+        } catch (error) {
+            toastr.error(error?.message || String(error));
+        }
+    });
+
+    renderSkillPreview();
+    callGenericPopup(root, POPUP_TYPE.TEXT, `格式修复 #${messageId}`, {
+        wide: true,
+        large: true,
+        allowVerticalScrolling: false,
     });
 }
 
@@ -2379,6 +2855,9 @@ function exposeApi() {
         getGeneratedSkills: () => clone(getGeneratedSkills()),
         fetchAvailableModels,
         generateFormatSkill,
+        repairMessageFormatWithSkill,
+        openMessageRepair: showMessageRepairPopup,
+        rollbackMessageRepair,
         openAgentSettings: showAgentSettings,
         openSavedSkills: showSavedSkillsBrowser,
         open: showPresetReader,
@@ -2388,5 +2867,6 @@ function exposeApi() {
 export function init() {
     addMenuButton();
     registerSlashCommands();
+    initMessageRepairButtons();
     exposeApi();
 }

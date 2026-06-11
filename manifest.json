@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Codex",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "homePage": "https://github.com/ping1999/preset-reader",
     "hooks": {
         "activate": "init"

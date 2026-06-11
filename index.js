@@ -13,8 +13,8 @@ const SHUJUKU_ID = 'shujuku_v120';
 const SHUJUKU_TEMPLATE_PRESETS_KEY = `${SHUJUKU_ID}_templatePresets_v1`;
 const SHUJUKU_CONFIG_DB = `${SHUJUKU_ID}_config_v1`;
 const SHUJUKU_CONFIG_STORE = 'kv';
-const AGENT_PRESET_ITEM_LIMIT = 8000;
-const AGENT_PRESET_TOTAL_LIMIT = 28000;
+const AGENT_PRESET_ITEM_LIMIT = 64000;
+const AGENT_PRESET_TOTAL_LIMIT = 128000;
 const AGENT_SYSTEM_PROMPT = `你是“预设格式修复 Skill 生成 Agent”。
 你的任务是阅读用户选中的 SillyTavern 预设 content，提取其中所有对输出格式、XML/HTML 标签、包裹符、章节顺序、字段名、禁止重复、语言风格、思考/正文分离的要求。
 你要输出一份可直接交给另一个 AI 使用的“格式修复 skill/提示词”。这份 skill 用来处理已经生成但没有遵守格式的文本：在不改写事实、不扩写剧情、不新增设定的前提下，重新补齐格式、标签、顺序和分段。
@@ -407,7 +407,51 @@ function readShujukuApiPresets(issues) {
         }
     }
 
-    return items;
+    return mergeRicherShujukuPlotItems(items);
+}
+
+function getExtractedPresetTextLength(content) {
+    try {
+        return extractPresetContentText(content).length;
+    } catch {
+        return safeStringify(content).length;
+    }
+}
+
+function mergeRicherShujukuPlotItems(items) {
+    const exportedByName = new Map(
+        items
+            .filter(item => item.kind === 'shujuku-plot-export')
+            .map(item => [String(item.name || '').trim(), item]),
+    );
+
+    return items.map(item => {
+        if (item.kind !== 'shujuku-plot') {
+            return item;
+        }
+
+        const exported = exportedByName.get(String(item.name || '').trim());
+        if (!exported) {
+            return item;
+        }
+
+        const itemLength = getExtractedPresetTextLength(item.content);
+        const exportedLength = getExtractedPresetTextLength(exported.content);
+        if (exportedLength <= itemLength) {
+            return item;
+        }
+
+        return {
+            ...item,
+            content: clone(exported.content),
+            meta: {
+                ...item.meta,
+                enrichedFrom: exported.kind,
+                originalContentLength: itemLength,
+                enrichedContentLength: exportedLength,
+            },
+        };
+    });
 }
 
 function readTemplateStoreFromExtensionSettings() {
@@ -690,34 +734,21 @@ function resultToMarkdown(snapshot) {
     return lines.join('\n');
 }
 
-function collectTextFromContent(value, parts, seen = new WeakSet(), label = 'content') {
-    if (value == null) {
-        return;
+function isPromptTextField(key, inherited = false) {
+    if (inherited) {
+        return true;
     }
 
-    if (typeof value === 'string') {
-        const text = value.trim();
-        if (text) {
-            parts.push(`【${label}】\n${text}`);
-        }
-        return;
+    const normalized = String(key || '').trim();
+    if (!normalized) {
+        return false;
     }
 
-    if (typeof value === 'number' || typeof value === 'boolean') {
-        return;
+    if (/group|tasks|list|settings|config|presets|entries|items|worldbooks/i.test(normalized)) {
+        return false;
     }
 
-    if (Array.isArray(value)) {
-        value.forEach((entry, index) => collectTextFromContent(entry, parts, seen, `${label}[${index}]`));
-        return;
-    }
-
-    if (typeof value !== 'object' || seen.has(value)) {
-        return;
-    }
-
-    seen.add(value);
-    const preferredKeys = [
+    const exactKeys = new Set([
         'content',
         'prompt',
         'system_prompt',
@@ -734,27 +765,60 @@ function collectTextFromContent(value, parts, seen = new WeakSet(), label = 'con
         'message',
         'prefix',
         'suffix',
-    ];
+        'finalSystemDirective',
+    ]);
 
-    for (const key of preferredKeys) {
-        if (Object.prototype.hasOwnProperty.call(value, key)) {
-            collectTextFromContent(value[key], parts, seen, key);
-        }
+    return exactKeys.has(normalized) || /content|prompt|rule|format|template|instruction|message|tag|wrap|prefix|suffix|directive/i.test(normalized);
+}
+
+function makeContentPathLabel(parent, key) {
+    if (typeof key === 'number') {
+        return `${parent}[${key}]`;
     }
 
+    if (!parent || parent === 'content') {
+        return String(key || 'content');
+    }
+
+    return `${parent}.${key}`;
+}
+
+function collectTextFromContent(value, parts, seen = new WeakSet(), label = 'content', inTextField = false) {
+    if (value == null) {
+        return;
+    }
+
+    if (typeof value === 'string') {
+        const text = value.trim();
+        if (text && inTextField) {
+            parts.push(`【${label}】\n${text}`);
+        }
+        return;
+    }
+
+    if (typeof value === 'number' || typeof value === 'boolean') {
+        return;
+    }
+
+    if (Array.isArray(value)) {
+        value.forEach((entry, index) => collectTextFromContent(entry, parts, seen, makeContentPathLabel(label, index), inTextField));
+        return;
+    }
+
+    if (typeof value !== 'object' || seen.has(value)) {
+        return;
+    }
+
+    seen.add(value);
     for (const [key, entry] of Object.entries(value)) {
-        if (preferredKeys.includes(key)) {
-            continue;
-        }
-        if (/content|prompt|rule|format|template|instruction|message|tag|wrap|prefix|suffix/i.test(key)) {
-            collectTextFromContent(entry, parts, seen, key);
-        }
+        const nextIsTextField = isPromptTextField(key, inTextField);
+        collectTextFromContent(entry, parts, seen, makeContentPathLabel(label, key), nextIsTextField);
     }
 }
 
 function extractPresetContentText(content) {
     const parts = [];
-    collectTextFromContent(content, parts);
+    collectTextFromContent(content, parts, new WeakSet(), 'content', false);
 
     if (!parts.length) {
         return safeStringify(content);

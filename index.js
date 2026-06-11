@@ -30,6 +30,7 @@ const DEFAULT_AGENT_SETTINGS = Object.freeze({
     activeApiPresetId: 'default',
     apiPresets: [],
     selectedPresetKeys: [],
+    generatedSkills: [],
 });
 
 let lastSnapshot = null;
@@ -95,6 +96,8 @@ function getSettingsRoot() {
     if (!Array.isArray(extension_settings[EXTENSION_ID].agent.selectedPresetKeys)) {
         extension_settings[EXTENSION_ID].agent.selectedPresetKeys = [];
     }
+    extension_settings[EXTENSION_ID].agent.selectedPresetKeys = extension_settings[EXTENSION_ID].agent.selectedPresetKeys.slice(0, 1);
+    normalizeGeneratedSkills(extension_settings[EXTENSION_ID].agent);
 
     return extension_settings[EXTENSION_ID];
 }
@@ -106,6 +109,10 @@ function getAgentSettings() {
         ...settings,
         apiPresets: settings.apiPresets.map(preset => ({ ...preset })),
         selectedPresetKeys: [...(settings.selectedPresetKeys || [])],
+        generatedSkills: settings.generatedSkills.map(skill => ({
+            ...skill,
+            selectedPresets: skill.selectedPresets.map(preset => ({ ...preset })),
+        })),
     };
 }
 
@@ -116,11 +123,68 @@ function saveAgentSettings(nextSettings) {
         ...nextSettings,
         endpoint: normalizeAgentBaseEndpoint(nextSettings.endpoint ?? root.agent.endpoint),
         selectedPresetKeys: Array.isArray(nextSettings.selectedPresetKeys)
-            ? [...nextSettings.selectedPresetKeys]
+            ? [...nextSettings.selectedPresetKeys].slice(0, 1)
             : root.agent.selectedPresetKeys,
+        generatedSkills: Array.isArray(nextSettings.generatedSkills)
+            ? nextSettings.generatedSkills
+            : root.agent.generatedSkills,
     };
     normalizeAgentApiPresets(root.agent);
+    normalizeGeneratedSkills(root.agent);
     saveSettingsDebounced();
+}
+
+function makeSkillId() {
+    return `skill-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeGeneratedSkill(skill) {
+    const safeSkill = skill && typeof skill === 'object' ? skill : {};
+    const selectedPresets = Array.isArray(safeSkill.selectedPresets) ? safeSkill.selectedPresets : [];
+    return {
+        id: String(safeSkill.id || makeSkillId()),
+        name: String(safeSkill.name || '格式修复 Skill'),
+        generatedAt: String(safeSkill.generatedAt || new Date().toISOString()),
+        model: String(safeSkill.model || ''),
+        endpoint: String(safeSkill.endpoint || ''),
+        selectedPresets: selectedPresets.map(preset => ({
+            source: String(preset.source || ''),
+            sourceLabel: String(preset.sourceLabel || ''),
+            kind: String(preset.kind || ''),
+            kindLabel: String(preset.kindLabel || ''),
+            name: String(preset.name || ''),
+        })),
+        skill: String(safeSkill.skill || ''),
+    };
+}
+
+function normalizeGeneratedSkills(agentSettings) {
+    if (!Array.isArray(agentSettings.generatedSkills)) {
+        agentSettings.generatedSkills = [];
+    }
+
+    agentSettings.generatedSkills = agentSettings.generatedSkills
+        .map(normalizeGeneratedSkill)
+        .filter(skill => skill.skill.trim());
+}
+
+function createUniqueSkillName(baseName, skills, ignoreId = '') {
+    const cleanBaseName = String(baseName || '格式修复 Skill').trim() || '格式修复 Skill';
+    const existingNames = new Set(
+        skills
+            .filter(skill => skill.id !== ignoreId)
+            .map(skill => String(skill.name || '').trim()),
+    );
+
+    if (!existingNames.has(cleanBaseName)) {
+        return cleanBaseName;
+    }
+
+    let index = 2;
+    while (existingNames.has(`${cleanBaseName} ${index}`)) {
+        index += 1;
+    }
+    return `${cleanBaseName} ${index}`;
 }
 
 function makeApiPresetId() {
@@ -1036,20 +1100,26 @@ function extractAgentResponseText(payload) {
 }
 
 function rememberFormatSkillResult(skillText, model, endpoint, selectedItems) {
-    lastFormatSkill = {
+    const settings = getAgentSettings();
+    const selectedPresets = selectedItems.map(item => ({
+        source: item.source,
+        sourceLabel: item.sourceLabel,
+        kind: item.kind,
+        kindLabel: item.kindLabel,
+        name: item.name,
+    }));
+    const savedSkill = normalizeGeneratedSkill({
+        id: makeSkillId(),
+        name: createUniqueSkillName(selectedPresets[0]?.name || '格式修复 Skill', settings.generatedSkills),
         generatedAt: new Date().toISOString(),
         model,
         endpoint,
-        selectedPresets: selectedItems.map(item => ({
-            source: item.source,
-            sourceLabel: item.sourceLabel,
-            kind: item.kind,
-            kindLabel: item.kindLabel,
-            name: item.name,
-        })),
+        selectedPresets,
         skill: skillText,
-    };
+    });
 
+    saveAgentSettings({ generatedSkills: [savedSkill, ...settings.generatedSkills] });
+    lastFormatSkill = clone(savedSkill);
     return lastFormatSkill;
 }
 
@@ -1097,6 +1167,10 @@ async function generateFormatSkill(selectedItems, settings = getAgentSettings())
         throw new Error('请先勾选要交给 Agent 分析的预设。');
     }
 
+    if (selectedItems.length > 1) {
+        throw new Error('一次只能选择一个预设生成 Skill。');
+    }
+
     if (!backendEndpoint) {
         throw new Error('请先配置 Agent API 地址。');
     }
@@ -1112,35 +1186,19 @@ function makePopupHtml() {
     return $(`
         <div id="${EXTENSION_ID}-panel" class="preset-reader-panel">
             <div class="preset-reader-toolbar">
-                <button id="${EXTENSION_ID}-refresh" class="menu_button">
-                    <i class="fa-solid fa-rotate-right"></i>
-                    <span>刷新</span>
-                </button>
-                <button id="${EXTENSION_ID}-copy" class="menu_button">
-                    <i class="fa-solid fa-copy"></i>
-                    <span>复制当前</span>
-                </button>
-                <button id="${EXTENSION_ID}-export" class="menu_button">
-                    <i class="fa-solid fa-download"></i>
-                    <span>导出 JSON</span>
-                </button>
-                <button id="${EXTENSION_ID}-select-visible" class="menu_button">
-                    <i class="fa-solid fa-check-double"></i>
-                    <span>预选可见</span>
-                </button>
-                <button id="${EXTENSION_ID}-clear-selected" class="menu_button">
-                    <i class="fa-solid fa-square-xmark"></i>
-                    <span>清空预选</span>
-                </button>
                 <button id="${EXTENSION_ID}-agent-settings" class="menu_button">
                     <i class="fa-solid fa-key"></i>
                     <span>Agent API</span>
+                </button>
+                <button id="${EXTENSION_ID}-saved-skills" class="menu_button">
+                    <i class="fa-solid fa-folder-open"></i>
+                    <span>浏览 Skill</span>
                 </button>
                 <button id="${EXTENSION_ID}-generate-skill" class="menu_button">
                     <i class="fa-solid fa-wand-magic-sparkles"></i>
                     <span>生成格式 Skill</span>
                 </button>
-                <span id="${EXTENSION_ID}-selected-count" class="preset-reader-selected-count">已预选 0</span>
+                <span id="${EXTENSION_ID}-selected-count" class="preset-reader-selected-count">未选择</span>
             </div>
             <div class="preset-reader-filters">
                 <label>
@@ -1159,11 +1217,11 @@ function makePopupHtml() {
             <div id="${EXTENSION_ID}-status" class="preset-reader-status">正在读取...</div>
             <div class="preset-reader-selected-panel">
                 <div class="preset-reader-selected-panel-header">
-                    <strong>预选清单</strong>
-                    <small id="${EXTENSION_ID}-selected-summary">勾选后显示</small>
+                    <strong>当前预设</strong>
+                    <small id="${EXTENSION_ID}-selected-summary">选择一个预设后显示</small>
                 </div>
                 <div id="${EXTENSION_ID}-selected-list" class="preset-reader-selected-list">
-                    <span class="preset-reader-selected-empty">暂无预选</span>
+                    <span class="preset-reader-selected-empty">未选择</span>
                 </div>
             </div>
             <div class="preset-reader-layout">
@@ -1218,11 +1276,26 @@ function groupItems(items) {
     return groups;
 }
 
+function getExpandedGroups(root) {
+    let groups = root.data('expanded-groups');
+    if (!(groups instanceof Set)) {
+        groups = new Set();
+        root.data('expanded-groups', groups);
+    }
+    return groups;
+}
+
 function getPreselectedKeys(root) {
     let keys = root.data('preselected-keys');
     if (!(keys instanceof Set)) {
-        keys = new Set(getAgentSettings().selectedPresetKeys);
+        keys = new Set(getAgentSettings().selectedPresetKeys.slice(0, 1));
         root.data('preselected-keys', keys);
+    } else if (keys.size > 1) {
+        const firstKey = [...keys][0];
+        keys.clear();
+        if (firstKey) {
+            keys.add(firstKey);
+        }
     }
     return keys;
 }
@@ -1250,11 +1323,11 @@ function renderPreselectedPanel(root) {
     const selectedList = root.find(`#${EXTENSION_ID}-selected-list`);
     const summary = root.find(`#${EXTENSION_ID}-selected-summary`);
 
-    summary.text(selectedItems.length ? `${selectedItems.length} 个预设` : '勾选后显示');
+    summary.text(selectedItems.length ? `${selectedItems[0].sourceLabel} / ${selectedItems[0].kindLabel}` : '选择一个预设后显示');
     selectedList.empty();
 
     if (!selectedItems.length) {
-        selectedList.append($('<span class="preset-reader-selected-empty"></span>').text('暂无预选'));
+        selectedList.append($('<span class="preset-reader-selected-empty"></span>').text('未选择'));
         return;
     }
 
@@ -1284,24 +1357,9 @@ function renderPreselectedPanel(root) {
 
 function updateSelectedCount(root) {
     const count = getPreselectedItems(root).length;
-    root.find(`#${EXTENSION_ID}-selected-count`).text(`已预选 ${count}`);
-    root.find(`#${EXTENSION_ID}-generate-skill`).prop('disabled', count === 0);
+    root.find(`#${EXTENSION_ID}-selected-count`).text(count ? '已选择 1/1' : '未选择');
+    root.find(`#${EXTENSION_ID}-generate-skill`).prop('disabled', count !== 1);
     renderPreselectedPanel(root);
-}
-
-function selectVisibleItems(root) {
-    const allItems = root.data('all-items') || [];
-    const visible = filterItems(allItems, getUiFilters(root));
-    const keys = getPreselectedKeys(root);
-    visible.forEach(item => keys.add(item.selectionKey));
-    savePreselectedKeys(root);
-    renderList(root, allItems);
-}
-
-function clearPreselectedItems(root) {
-    getPreselectedKeys(root).clear();
-    savePreselectedKeys(root);
-    renderList(root, root.data('all-items') || []);
 }
 
 function renderList(root, allItems) {
@@ -1309,6 +1367,7 @@ function renderList(root, allItems) {
     const filtered = filterItems(allItems, getUiFilters(root));
     const preselectedKeys = getPreselectedKeys(root);
     const selectedItem = root.data('selected-item');
+    const expandedGroups = getExpandedGroups(root);
     list.empty();
 
     if (!filtered.length) {
@@ -1319,12 +1378,35 @@ function renderList(root, allItems) {
     }
 
     for (const [group, items] of groupItems(filtered)) {
-        list.append($('<div class="preset-reader-group"></div>').text(group));
+        const isExpanded = expandedGroups.has(group);
+        const groupHeader = $(`
+            <button class="preset-reader-group" type="button">
+                <i class="fa-solid fa-chevron-right"></i>
+                <span></span>
+                <small></small>
+            </button>
+        `);
+        groupHeader.toggleClass('is-expanded', isExpanded);
+        groupHeader.find('span').text(group);
+        groupHeader.find('small').text(`${items.length}`);
+        groupHeader.on('click', () => {
+            if (expandedGroups.has(group)) {
+                expandedGroups.delete(group);
+            } else {
+                expandedGroups.add(group);
+            }
+            renderList(root, allItems);
+        });
+        list.append(groupHeader);
+        if (!isExpanded) {
+            continue;
+        }
+
         items.forEach(item => {
             const row = $(`
                 <div class="preset-reader-item-row">
                     <label class="preset-reader-preselect-wrap">
-                        <input class="preset-reader-preselect" type="checkbox" aria-label="预选给 Agent">
+                        <input class="preset-reader-preselect" type="radio" name="${EXTENSION_ID}-preselect" aria-label="选择给 Agent">
                     </label>
                     <button class="preset-reader-item" type="button">
                         <span class="preset-reader-item-name"></span>
@@ -1343,11 +1425,15 @@ function renderList(root, allItems) {
             row.find('small').text(`${getContentMetric(item.content)}${item.warning ? ' / 有提示' : ''}`);
             checkbox.on('change', () => {
                 if (checkbox.prop('checked')) {
+                    preselectedKeys.clear();
                     preselectedKeys.add(item.selectionKey);
-                } else {
-                    preselectedKeys.delete(item.selectionKey);
+                    list.find('.preset-reader-item').removeClass('is-selected');
+                    itemButton.addClass('is-selected');
+                    renderPreview(root, item);
                 }
                 savePreselectedKeys(root);
+                list.find('.preset-reader-preselect').prop('checked', false);
+                checkbox.prop('checked', preselectedKeys.has(item.selectionKey));
                 updateSelectedCount(root);
             });
             itemButton.on('click', () => {
@@ -1401,47 +1487,12 @@ async function loadIntoPanel(root) {
     }));
 
     if (!(root.data('preselected-keys') instanceof Set)) {
-        root.data('preselected-keys', new Set(getAgentSettings().selectedPresetKeys));
+        root.data('preselected-keys', new Set(getAgentSettings().selectedPresetKeys.slice(0, 1)));
     }
     root.data('all-items', allItems);
     refreshFilterOptions(root, allItems);
     renderStatus(root, snapshot);
     renderList(root, allItems);
-}
-
-async function copySelected(root) {
-    const item = root.data('selected-item');
-    const value = item ? safeStringify(item.content) : safeStringify(lastSnapshot);
-
-    try {
-        await navigator.clipboard.writeText(value);
-        toastr.success('已复制到剪贴板');
-    } catch {
-        toastr.error('复制失败');
-    }
-}
-
-function exportCurrent(root) {
-    const filters = getUiFilters(root);
-    const allItems = root.data('all-items') || [];
-    const filteredItems = filterItems(allItems, filters).map(item => ({
-        source: item.source,
-        sourceLabel: item.sourceLabel,
-        kind: item.kind,
-        kindLabel: item.kindLabel,
-        name: item.name,
-        status: item.status,
-        warning: item.warning,
-        meta: item.meta,
-        content: item.content,
-    }));
-    const payload = {
-        generatedAt: new Date().toISOString(),
-        filters,
-        counts: summarizeCounts(filteredItems),
-        items: filteredItems,
-    };
-    download(safeStringify(payload), `${sanitizeFileName('preset-reader-export')}.json`, 'application/json');
 }
 
 function setAgentSettingsForm(root, preset) {
@@ -1784,6 +1835,156 @@ function showAgentSettings() {
     loadAgentModelsIntoSettings(root, { silent: true });
 }
 
+function getGeneratedSkills() {
+    return getAgentSettings().generatedSkills;
+}
+
+function saveGeneratedSkills(skills) {
+    saveAgentSettings({ generatedSkills: skills });
+}
+
+function formatSavedSkillDate(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return '';
+    }
+
+    return date.toLocaleString();
+}
+
+function getSavedSkillSourceText(skill) {
+    const preset = skill.selectedPresets?.[0];
+    if (!preset) {
+        return '未知预设';
+    }
+
+    return `${preset.sourceLabel || preset.source} / ${preset.kindLabel || preset.kind}`;
+}
+
+function showSavedSkillsBrowser() {
+    const root = $(`
+        <div class="preset-reader-skill-browser">
+            <div class="preset-reader-skill-browser-sidebar">
+                <div id="${EXTENSION_ID}-skill-browser-list" class="preset-reader-skill-browser-list"></div>
+            </div>
+            <div class="preset-reader-skill-browser-main">
+                <div class="preset-reader-skill-browser-toolbar">
+                    <input id="${EXTENSION_ID}-skill-browser-name" type="text" placeholder="Skill 名称">
+                    <button id="${EXTENSION_ID}-skill-browser-rename" class="menu_button" type="button">
+                        <i class="fa-solid fa-pen"></i>
+                        <span>改名</span>
+                    </button>
+                    <button id="${EXTENSION_ID}-skill-browser-export" class="menu_button" type="button">
+                        <i class="fa-solid fa-download"></i>
+                        <span>导出</span>
+                    </button>
+                    <button id="${EXTENSION_ID}-skill-browser-delete" class="menu_button" type="button">
+                        <i class="fa-solid fa-trash"></i>
+                        <span>删除</span>
+                    </button>
+                </div>
+                <div id="${EXTENSION_ID}-skill-browser-meta" class="preset-reader-skill-browser-meta"></div>
+                <textarea id="${EXTENSION_ID}-skill-browser-content" readonly></textarea>
+            </div>
+        </div>
+    `);
+    let activeId = null;
+
+    const getActiveSkill = () => getGeneratedSkills().find(skill => skill.id === activeId) || null;
+    const render = () => {
+        const skills = getGeneratedSkills();
+        const list = root.find(`#${EXTENSION_ID}-skill-browser-list`);
+        const nameInput = root.find(`#${EXTENSION_ID}-skill-browser-name`);
+        const meta = root.find(`#${EXTENSION_ID}-skill-browser-meta`);
+        const content = root.find(`#${EXTENSION_ID}-skill-browser-content`);
+        const actionButtons = root.find(`#${EXTENSION_ID}-skill-browser-rename, #${EXTENSION_ID}-skill-browser-export, #${EXTENSION_ID}-skill-browser-delete`);
+
+        list.empty();
+        if (!skills.length) {
+            activeId = null;
+            list.append($('<div class="preset-reader-empty"></div>').text('还没有保存过 Skill'));
+            nameInput.val('');
+            meta.text('');
+            content.val('');
+            actionButtons.prop('disabled', true);
+            return;
+        }
+
+        if (!skills.some(skill => skill.id === activeId)) {
+            activeId = skills[0].id;
+        }
+
+        skills.forEach(skill => {
+            const item = $(`
+                <button class="preset-reader-skill-browser-item" type="button">
+                    <strong></strong>
+                    <small></small>
+                </button>
+            `);
+            item.toggleClass('is-selected', skill.id === activeId);
+            item.find('strong').text(skill.name);
+            item.find('small').text(`${getSavedSkillSourceText(skill)} / ${formatSavedSkillDate(skill.generatedAt)}`);
+            item.on('click', () => {
+                activeId = skill.id;
+                render();
+            });
+            list.append(item);
+        });
+
+        const activeSkill = getActiveSkill();
+        nameInput.val(activeSkill.name);
+        meta.text(`${getSavedSkillSourceText(activeSkill)} / ${activeSkill.model || '未记录模型'} / ${formatSavedSkillDate(activeSkill.generatedAt)}`);
+        content.val(activeSkill.skill);
+        actionButtons.prop('disabled', false);
+    };
+
+    root.find(`#${EXTENSION_ID}-skill-browser-rename`).on('click', () => {
+        const activeSkill = getActiveSkill();
+        if (!activeSkill) {
+            return;
+        }
+
+        const skills = getGeneratedSkills();
+        const name = createUniqueSkillName(root.find(`#${EXTENSION_ID}-skill-browser-name`).val(), skills, activeSkill.id);
+        saveGeneratedSkills(skills.map(skill => skill.id === activeSkill.id ? { ...skill, name } : skill));
+        toastr.success('Skill 已改名');
+        render();
+    });
+
+    root.find(`#${EXTENSION_ID}-skill-browser-export`).on('click', () => {
+        const activeSkill = getActiveSkill();
+        if (!activeSkill) {
+            return;
+        }
+
+        download(activeSkill.skill, `${sanitizeFileName(activeSkill.name)}.md`, 'text/markdown');
+    });
+
+    root.find(`#${EXTENSION_ID}-skill-browser-delete`).on('click', () => {
+        const activeSkill = getActiveSkill();
+        if (!activeSkill) {
+            return;
+        }
+
+        if (!confirm(`删除 Skill「${activeSkill.name}」？`)) {
+            return;
+        }
+
+        const skills = getGeneratedSkills().filter(skill => skill.id !== activeSkill.id);
+        saveGeneratedSkills(skills);
+        activeId = skills[0]?.id || null;
+        toastr.success('Skill 已删除');
+        render();
+    });
+
+    render();
+    callGenericPopup(root, POPUP_TYPE.TEXT, '已保存 Skill', {
+        wide: true,
+        large: true,
+        allowVerticalScrolling: false,
+    });
+}
+
 function showAgentResult(result) {
     const root = $(`
         <div class="preset-reader-agent-result">
@@ -1796,7 +1997,7 @@ function showAgentResult(result) {
                     <i class="fa-solid fa-download"></i>
                     <span>下载 Markdown</span>
                 </button>
-                <span>${escapeHtml(result.model)} / ${result.selectedPresets.length} 个预设</span>
+                <span>${escapeHtml(result.name)} / ${escapeHtml(result.model)} / 已保存</span>
             </div>
             <textarea id="${EXTENSION_ID}-agent-result-text" readonly></textarea>
         </div>
@@ -1811,7 +2012,7 @@ function showAgentResult(result) {
         }
     });
     root.find(`#${EXTENSION_ID}-agent-download-result`).on('click', () => {
-        download(result.skill, `${sanitizeFileName('preset-format-skill')}.md`, 'text/markdown');
+        download(result.skill, `${sanitizeFileName(result.name)}.md`, 'text/markdown');
     });
 
     callGenericPopup(root, POPUP_TYPE.TEXT, '格式修复 Skill', {
@@ -1830,17 +2031,22 @@ async function generateFormatSkillFromPanel(root) {
         return;
     }
 
+    if (selectedItems.length > 1) {
+        toastr.warning('一次只能选择一个预设生成 Skill');
+        return;
+    }
+
     try {
         button.prop('disabled', true);
         button.find('span').text('生成中...');
-        root.find(`#${EXTENSION_ID}-status`).text(`Agent 正在分析 ${selectedItems.length} 个预设...`);
+        root.find(`#${EXTENSION_ID}-status`).text(`Agent 正在分析「${selectedItems[0].name}」...`);
 
         const result = await generateFormatSkill(selectedItems);
         if (lastSnapshot) {
             renderStatus(root, lastSnapshot);
         }
         showAgentResult(result);
-        toastr.success('格式修复 Skill 已生成');
+        toastr.success('格式修复 Skill 已生成并保存');
     } catch (error) {
         if (lastSnapshot) {
             renderStatus(root, lastSnapshot);
@@ -1854,12 +2060,8 @@ async function generateFormatSkillFromPanel(root) {
 
 async function showPresetReader() {
     const root = makePopupHtml();
-    root.find(`#${EXTENSION_ID}-refresh`).on('click', () => loadIntoPanel(root).catch(error => toastr.error(error?.message || String(error))));
-    root.find(`#${EXTENSION_ID}-copy`).on('click', () => copySelected(root));
-    root.find(`#${EXTENSION_ID}-export`).on('click', () => exportCurrent(root));
-    root.find(`#${EXTENSION_ID}-select-visible`).on('click', () => selectVisibleItems(root));
-    root.find(`#${EXTENSION_ID}-clear-selected`).on('click', () => clearPreselectedItems(root));
     root.find(`#${EXTENSION_ID}-agent-settings`).on('click', () => showAgentSettings());
+    root.find(`#${EXTENSION_ID}-saved-skills`).on('click', () => showSavedSkillsBrowser());
     root.find(`#${EXTENSION_ID}-generate-skill`).on('click', () => generateFormatSkillFromPanel(root));
     root.find(`#${EXTENSION_ID}-source, #${EXTENSION_ID}-kind, #${EXTENSION_ID}-search`).on('input change', () => {
         renderList(root, root.data('all-items') || []);
@@ -1964,9 +2166,11 @@ function exposeApi() {
         getLastFormatSkill: () => clone(lastFormatSkill),
         getAgentSettings,
         saveAgentSettings,
+        getGeneratedSkills: () => clone(getGeneratedSkills()),
         fetchAvailableModels,
         generateFormatSkill,
         openAgentSettings: showAgentSettings,
+        openSavedSkills: showSavedSkillsBrowser,
         open: showPresetReader,
     };
 }

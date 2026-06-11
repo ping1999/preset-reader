@@ -1,0 +1,14 @@
+{
+    "display_name": "预设读取器",
+    "loading_order": 101,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Codex",
+    "version": "1.0.0",
+    "homePage": "https://github.com/SillyTavern/SillyTavern",
+    "hooks": {
+        "activate": "init"
+    }
+}

@@ -358,7 +358,6 @@
 
 .preset-reader-api-preset-row .menu_button,
 .preset-reader-model-field .menu_button,
-.preset-reader-agent-settings-actions .menu_button,
 .preset-reader-api-preset-editor-actions .menu_button {
     display: inline-flex;
     flex: 0 0 auto;
@@ -441,7 +440,6 @@
     gap: 10px;
 }
 
-.preset-reader-agent-settings-actions,
 .preset-reader-agent-result-toolbar {
     display: flex;
     flex-wrap: wrap;
@@ -549,6 +547,10 @@
 .preset-reader-skill-browser-toolbar input {
     flex: 1 1 220px;
     min-width: 0;
+}
+
+.preset-reader-hidden-file-input {
+    display: none;
 }
 
 .preset-reader-skill-browser-toolbar input,

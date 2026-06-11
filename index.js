@@ -1686,12 +1686,6 @@ function makeAgentSettingsHtml() {
                     <input id="${EXTENSION_ID}-agent-max-tokens" type="number" min="256" max="32000" step="128">
                 </label>
             </div>
-            <div class="preset-reader-agent-settings-actions">
-                <button id="${EXTENSION_ID}-agent-save" class="menu_button">
-                    <i class="fa-solid fa-floppy-disk"></i>
-                    <span>保存配置</span>
-                </button>
-            </div>
         </div>
     `).each((_, root) => {
         const panel = $(root);
@@ -1809,7 +1803,7 @@ function showAgentSettings() {
 
     root.find(`#${EXTENSION_ID}-agent-api-preset`).on('change', event => applyApiPresetToForm(root, event.target.value));
     root.find(`#${EXTENSION_ID}-agent-edit-preset`).on('click', () => showApiPresetEditor(root));
-    root.find(`#${EXTENSION_ID}-agent-save-preset, #${EXTENSION_ID}-agent-save`).on('click', () => {
+    root.find(`#${EXTENSION_ID}-agent-save-preset`).on('click', () => {
         saveCurrentApiPreset(root);
         loadAgentModelsIntoSettings(root, { silent: true });
     });
@@ -1861,6 +1855,43 @@ function getSavedSkillSourceText(skill) {
     return `${preset.sourceLabel || preset.source} / ${preset.kindLabel || preset.kind}`;
 }
 
+function getFileBaseName(fileName) {
+    return String(fileName || '导入 Skill')
+        .replace(/\.[^.\\/]+$/, '')
+        .trim() || '导入 Skill';
+}
+
+function makeImportedSkill(rawText, fileName, existingSkills) {
+    const text = String(rawText || '').trim();
+    if (!text) {
+        throw new Error(`${fileName} 是空文件`);
+    }
+
+    const baseName = getFileBaseName(fileName);
+    const parsed = tryParseJson(text);
+    const parsedValue = parsed.ok && parsed.value && typeof parsed.value === 'object' ? parsed.value : null;
+    const skillText = String(parsedValue?.skill || parsedValue?.content || parsedValue?.prompt || text).trim();
+    const name = createUniqueSkillName(parsedValue?.name || baseName, existingSkills);
+
+    return normalizeGeneratedSkill({
+        id: makeSkillId(),
+        name,
+        generatedAt: parsedValue?.generatedAt || new Date().toISOString(),
+        model: parsedValue?.model || '导入',
+        endpoint: parsedValue?.endpoint || '',
+        selectedPresets: Array.isArray(parsedValue?.selectedPresets) && parsedValue.selectedPresets.length
+            ? parsedValue.selectedPresets
+            : [{
+                source: 'import',
+                sourceLabel: '导入',
+                kind: 'skill',
+                kindLabel: 'Skill',
+                name,
+            }],
+        skill: skillText,
+    });
+}
+
 function showSavedSkillsBrowser() {
     const root = $(`
         <div class="preset-reader-skill-browser">
@@ -1874,6 +1905,10 @@ function showSavedSkillsBrowser() {
                         <i class="fa-solid fa-pen"></i>
                         <span>改名</span>
                     </button>
+                    <button id="${EXTENSION_ID}-skill-browser-import" class="menu_button" type="button">
+                        <i class="fa-solid fa-file-import"></i>
+                        <span>导入</span>
+                    </button>
                     <button id="${EXTENSION_ID}-skill-browser-export" class="menu_button" type="button">
                         <i class="fa-solid fa-download"></i>
                         <span>导出</span>
@@ -1882,6 +1917,7 @@ function showSavedSkillsBrowser() {
                         <i class="fa-solid fa-trash"></i>
                         <span>删除</span>
                     </button>
+                    <input id="${EXTENSION_ID}-skill-browser-import-file" class="preset-reader-hidden-file-input" type="file" accept=".md,.markdown,.txt,.json,application/json,text/plain,text/markdown" multiple>
                 </div>
                 <div id="${EXTENSION_ID}-skill-browser-meta" class="preset-reader-skill-browser-meta"></div>
                 <textarea id="${EXTENSION_ID}-skill-browser-content" readonly></textarea>
@@ -1937,6 +1973,44 @@ function showSavedSkillsBrowser() {
         content.val(activeSkill.skill);
         actionButtons.prop('disabled', false);
     };
+
+    root.find(`#${EXTENSION_ID}-skill-browser-import`).on('click', () => {
+        root.find(`#${EXTENSION_ID}-skill-browser-import-file`).trigger('click');
+    });
+
+    root.find(`#${EXTENSION_ID}-skill-browser-import-file`).on('change', async event => {
+        const files = [...(event.target.files || [])];
+        if (!files.length) {
+            return;
+        }
+
+        const imported = [];
+        const failed = [];
+        const skills = getGeneratedSkills();
+
+        for (const file of files) {
+            try {
+                const text = await file.text();
+                const skill = makeImportedSkill(text, file.name, [...imported, ...skills]);
+                imported.push(skill);
+            } catch (error) {
+                failed.push(`${file.name}: ${error?.message || String(error)}`);
+            }
+        }
+
+        if (imported.length) {
+            saveGeneratedSkills([...imported, ...skills]);
+            activeId = imported[0].id;
+            toastr.success(`已导入 ${imported.length} 个 Skill`);
+        }
+
+        if (failed.length) {
+            toastr.error(`导入失败：${failed.join('；')}`);
+        }
+
+        event.target.value = '';
+        render();
+    });
 
     root.find(`#${EXTENSION_ID}-skill-browser-rename`).on('click', () => {
         const activeSkill = getActiveSkill();

@@ -54,7 +54,7 @@ The model box automatically fetches available models from `/models`, and generat
 Agent requests are always sent through SillyTavern's backend, so LAN HTTP APIs, HTTPS SillyTavern pages, and providers that do not allow browser CORS requests can still work.
 When building the agent request, the extension recursively scans the selected preset object for prompt text fields such as `content`, `rules`, `format`, and `template`. For shujuku plot presets, a same-name `exportAllPlotPresets` record is used to enrich the displayed preset when it contains more complete content.
 
-After that, click `生成格式 Skill`. The agent reads the selected preset's `content` text, extracts formatting rules such as paired tags, section order, wrapper names, and output-only constraints, then returns a reusable repair prompt/skill. Generated skills are saved in the extension automatically, named after the source preset by default; duplicate names receive a numeric suffix. Use `浏览 Skill` to rename, delete, or export saved skills.
+After that, click `生成格式 Skill`. The agent reads the selected preset's `content` text, extracts formatting rules such as paired tags, section order, wrapper names, and output-only constraints, then returns a reusable repair prompt/skill. Generated skills are saved in the extension automatically, named after the source preset by default; duplicate names receive a numeric suffix. Use `浏览 Skill` to rename, delete, import, or export saved skills.
 
 Public API:
 

@@ -25,6 +25,7 @@ const DEFAULT_AGENT_SETTINGS = Object.freeze({
     endpoint: 'https://api.openai.com/v1/chat/completions',
     model: '',
     apiKey: '',
+    requestMode: 'sillytavern',
     temperature: 0.2,
     maxTokens: 1800,
     selectedPresetKeys: [],
@@ -829,6 +830,31 @@ function normalizeAgentEndpoint(endpoint) {
     return `${trimmed}/v1/chat/completions`;
 }
 
+function normalizeAgentBaseEndpoint(endpoint) {
+    const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
+    if (!trimmed) {
+        return '';
+    }
+
+    if (/\/chat\/completions$/i.test(trimmed)) {
+        return trimmed.replace(/\/chat\/completions$/i, '');
+    }
+
+    if (/\/completions$/i.test(trimmed)) {
+        return trimmed.replace(/\/completions$/i, '');
+    }
+
+    if (/\/models$/i.test(trimmed)) {
+        return trimmed.replace(/\/models$/i, '');
+    }
+
+    if (/\/v1$/i.test(trimmed)) {
+        return trimmed;
+    }
+
+    return `${trimmed}/v1`;
+}
+
 function normalizeModelsEndpoint(endpoint) {
     const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
     if (!trimmed) {
@@ -854,7 +880,29 @@ function normalizeModelsEndpoint(endpoint) {
     return `${trimmed}/v1/models`;
 }
 
+function shouldUseSillyTavernBackend(settings) {
+    return String(settings.requestMode || DEFAULT_AGENT_SETTINGS.requestMode) === 'sillytavern';
+}
+
+function makeSillyTavernBackendPayload(settings, extra = {}) {
+    return {
+        chat_completion_source: 'openai',
+        reverse_proxy: normalizeAgentBaseEndpoint(settings.endpoint),
+        proxy_password: settings.apiKey || '',
+        stream: false,
+        ...extra,
+    };
+}
+
+function makeDirectFetchError(error) {
+    return new Error(`浏览器直连失败：${error?.message || String(error)}。如果 API 是内网 HTTP、未开启 CORS，或酒馆页面是 HTTPS，请把请求方式设为“酒馆后端转发”。`);
+}
+
 async function fetchAvailableModels(settings = getAgentSettings()) {
+    if (shouldUseSillyTavernBackend(settings)) {
+        return fetchAvailableModelsViaSillyTavern(settings);
+    }
+
     const endpoint = normalizeModelsEndpoint(settings.endpoint);
     if (!endpoint) {
         throw new Error('请先填写 API 地址。');
@@ -865,7 +913,12 @@ async function fetchAvailableModels(settings = getAgentSettings()) {
         headers.Authorization = `Bearer ${settings.apiKey}`;
     }
 
-    const response = await fetch(endpoint, { headers });
+    let response;
+    try {
+        response = await fetch(endpoint, { headers });
+    } catch (error) {
+        throw makeDirectFetchError(error);
+    }
     const responseText = await response.text();
     let payload = null;
 
@@ -877,6 +930,37 @@ async function fetchAvailableModels(settings = getAgentSettings()) {
 
     if (!response.ok) {
         throw new Error(payload?.error?.message || responseText || `模型列表读取失败：HTTP ${response.status}`);
+    }
+
+    const models = Array.isArray(payload?.data)
+        ? payload.data.map(model => model?.id).filter(Boolean)
+        : [];
+
+    return [...new Set(models)].sort((a, b) => a.localeCompare(b));
+}
+
+async function fetchAvailableModelsViaSillyTavern(settings = getAgentSettings()) {
+    const reverseProxy = normalizeAgentBaseEndpoint(settings.endpoint);
+    if (!reverseProxy) {
+        throw new Error('请先填写 API 地址。');
+    }
+
+    const response = await fetch('/api/backends/chat-completions/status', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(makeSillyTavernBackendPayload(settings)),
+    });
+    const responseText = await response.text();
+    let payload = null;
+
+    try {
+        payload = responseText ? JSON.parse(responseText) : null;
+    } catch {
+        payload = null;
+    }
+
+    if (!response.ok || payload?.error) {
+        throw new Error(payload?.error?.message || payload?.message || responseText || `模型列表读取失败：HTTP ${response.status}`);
     }
 
     const models = Array.isArray(payload?.data)
@@ -918,20 +1002,79 @@ function extractAgentResponseText(payload) {
     return '';
 }
 
+function rememberFormatSkillResult(skillText, model, endpoint, selectedItems) {
+    lastFormatSkill = {
+        generatedAt: new Date().toISOString(),
+        model,
+        endpoint,
+        selectedPresets: selectedItems.map(item => ({
+            source: item.source,
+            sourceLabel: item.sourceLabel,
+            kind: item.kind,
+            kindLabel: item.kindLabel,
+            name: item.name,
+        })),
+        skill: skillText,
+    };
+
+    return lastFormatSkill;
+}
+
+async function generateFormatSkillViaSillyTavern(selectedItems, settings, model, endpoint) {
+    const response = await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(makeSillyTavernBackendPayload(settings, {
+            model,
+            messages: [
+                { role: 'system', content: AGENT_SYSTEM_PROMPT },
+                { role: 'user', content: buildAgentUserPrompt(selectedItems) },
+            ],
+            temperature: Number(settings.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
+            max_tokens: Number(settings.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
+        })),
+    });
+
+    const responseText = await response.text();
+    let payload = null;
+
+    try {
+        payload = responseText ? JSON.parse(responseText) : null;
+    } catch {
+        payload = null;
+    }
+
+    if (!response.ok || payload?.error) {
+        throw new Error(payload?.error?.message || payload?.message || responseText || `Agent API 请求失败：HTTP ${response.status}`);
+    }
+
+    const skillText = extractAgentResponseText(payload).trim();
+    if (!skillText) {
+        throw new Error('Agent API 没有返回可用文本。');
+    }
+
+    return rememberFormatSkillResult(skillText, model, endpoint, selectedItems);
+}
+
 async function generateFormatSkill(selectedItems, settings = getAgentSettings()) {
     const endpoint = normalizeAgentEndpoint(settings.endpoint);
+    const backendEndpoint = normalizeAgentBaseEndpoint(settings.endpoint);
     const model = String(settings.model || '').trim();
 
     if (!selectedItems.length) {
         throw new Error('请先勾选要交给 Agent 分析的预设。');
     }
 
-    if (!endpoint) {
+    if (shouldUseSillyTavernBackend(settings) ? !backendEndpoint : !endpoint) {
         throw new Error('请先配置 Agent API 地址。');
     }
 
     if (!model) {
         throw new Error('请先配置 Agent 模型名。');
+    }
+
+    if (shouldUseSillyTavernBackend(settings)) {
+        return generateFormatSkillViaSillyTavern(selectedItems, settings, model, backendEndpoint);
     }
 
     const headers = {
@@ -942,19 +1085,24 @@ async function generateFormatSkill(selectedItems, settings = getAgentSettings())
         headers.Authorization = `Bearer ${settings.apiKey}`;
     }
 
-    const response = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-            model,
-            messages: [
-                { role: 'system', content: AGENT_SYSTEM_PROMPT },
-                { role: 'user', content: buildAgentUserPrompt(selectedItems) },
-            ],
-            temperature: Number(settings.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
-            max_tokens: Number(settings.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
-        }),
-    });
+    let response;
+    try {
+        response = await fetch(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                model,
+                messages: [
+                    { role: 'system', content: AGENT_SYSTEM_PROMPT },
+                    { role: 'user', content: buildAgentUserPrompt(selectedItems) },
+                ],
+                temperature: Number(settings.temperature ?? DEFAULT_AGENT_SETTINGS.temperature),
+                max_tokens: Number(settings.maxTokens ?? DEFAULT_AGENT_SETTINGS.maxTokens),
+            }),
+        });
+    } catch (error) {
+        throw makeDirectFetchError(error);
+    }
 
     const responseText = await response.text();
     let payload = null;
@@ -974,21 +1122,7 @@ async function generateFormatSkill(selectedItems, settings = getAgentSettings())
         throw new Error('Agent API 没有返回可用文本。');
     }
 
-    lastFormatSkill = {
-        generatedAt: new Date().toISOString(),
-        model,
-        endpoint,
-        selectedPresets: selectedItems.map(item => ({
-            source: item.source,
-            sourceLabel: item.sourceLabel,
-            kind: item.kind,
-            kindLabel: item.kindLabel,
-            name: item.name,
-        })),
-        skill: skillText,
-    };
-
-    return lastFormatSkill;
+    return rememberFormatSkillResult(skillText, model, endpoint, selectedItems);
 }
 
 function makePopupHtml() {
@@ -1282,6 +1416,13 @@ function makeAgentSettingsHtml() {
                 <input id="${EXTENSION_ID}-agent-endpoint" type="text" placeholder="https://api.openai.com/v1/chat/completions">
             </label>
             <label>
+                <span>请求方式</span>
+                <select id="${EXTENSION_ID}-agent-request-mode">
+                    <option value="sillytavern">酒馆后端转发（推荐，支持内网 HTTP）</option>
+                    <option value="browser">浏览器直连（需要 HTTPS/CORS）</option>
+                </select>
+            </label>
+            <label>
                 <span>模型</span>
                 <div class="preset-reader-model-field">
                     <input id="${EXTENSION_ID}-agent-model" type="text" list="${EXTENSION_ID}-agent-model-list" placeholder="gpt-4.1-mini">
@@ -1317,6 +1458,7 @@ function makeAgentSettingsHtml() {
     `).each((_, root) => {
         const panel = $(root);
         panel.find(`#${EXTENSION_ID}-agent-endpoint`).val(settings.endpoint);
+        panel.find(`#${EXTENSION_ID}-agent-request-mode`).val(settings.requestMode || DEFAULT_AGENT_SETTINGS.requestMode);
         panel.find(`#${EXTENSION_ID}-agent-model`).val(settings.model);
         panel.find(`#${EXTENSION_ID}-agent-api-key`).val(settings.apiKey);
         panel.find(`#${EXTENSION_ID}-agent-temperature`).val(settings.temperature);
@@ -1330,6 +1472,7 @@ function readAgentSettingsForm(root) {
 
     return {
         endpoint: String(root.find(`#${EXTENSION_ID}-agent-endpoint`).val() || '').trim(),
+        requestMode: String(root.find(`#${EXTENSION_ID}-agent-request-mode`).val() || DEFAULT_AGENT_SETTINGS.requestMode),
         model: String(root.find(`#${EXTENSION_ID}-agent-model`).val() || '').trim(),
         apiKey: String(root.find(`#${EXTENSION_ID}-agent-api-key`).val() || '').trim(),
         temperature: Number.isFinite(temperature) ? temperature : DEFAULT_AGENT_SETTINGS.temperature,
@@ -1393,7 +1536,7 @@ function showAgentSettings() {
         loadAgentModelsIntoSettings(root, { silent: true });
     });
     root.find(`#${EXTENSION_ID}-agent-refresh-models`).on('click', () => loadAgentModelsIntoSettings(root));
-    root.find(`#${EXTENSION_ID}-agent-endpoint, #${EXTENSION_ID}-agent-api-key`).on('change blur', scheduleModelFetch);
+    root.find(`#${EXTENSION_ID}-agent-endpoint, #${EXTENSION_ID}-agent-api-key, #${EXTENSION_ID}-agent-request-mode`).on('change blur', scheduleModelFetch);
 
     callGenericPopup(root, POPUP_TYPE.TEXT, 'Preset Reader Agent API', {
         wide: true,

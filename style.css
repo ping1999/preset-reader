@@ -206,11 +206,13 @@
     gap: 4px;
 }
 
-.preset-reader-agent-settings input {
+.preset-reader-agent-settings input,
+.preset-reader-agent-settings select {
     width: 100%;
 }
 
 .preset-reader-agent-settings input,
+.preset-reader-agent-settings select,
 #preset-reader-agent-result-text {
     border: 1px solid var(--SmartThemeBorderColor);
     border-radius: 4px;
